@@ -46,10 +46,11 @@ type ModuleDef struct {
 
 // Manager 房间管理器：模块注册、创建/定位房间、进/退房入口与存活计数。
 type Manager struct {
-	engine   *actor.Engine
-	sessions SessionProvider
-	storage  framework.Storage
-	logger   *slog.Logger
+	engine       *actor.Engine
+	sessions     SessionProvider
+	storage      framework.Storage
+	profileStore framework.ProfileStore // 玩家档案存取（§10.4），可空
+	logger       *slog.Logger
 
 	defaultTick   time.Duration
 	defaultPolicy framework.MailboxPolicy
@@ -69,6 +70,11 @@ func WithDefaultTick(d time.Duration) Option {
 // WithDefaultMailbox 房间 Actor 默认邮箱策略。
 func WithDefaultMailbox(p framework.MailboxPolicy) Option {
 	return func(m *Manager) { m.defaultPolicy = p }
+}
+
+// WithProfileStore 注入玩家档案存取接口（§10.4）。
+func WithProfileStore(ps framework.ProfileStore) Option {
+	return func(m *Manager) { m.profileStore = ps }
 }
 
 // NewManager 创建房间管理器。
@@ -330,6 +336,11 @@ func (m *member) PushSnapshot(msgID framework.MsgID, msg any) error {
 	return m.sess.PushSnapshot(msgID, msg)
 }
 
+// Profile 读取玩家档案快照（只读，§10.4.1）；未加载时返回 nil。
+func (m *member) Profile() *framework.PlayerProfile {
+	return m.sess.Profile()
+}
+
 // roomCtx 实现 framework.RoomCtx（全部方法在 RoomActor goroutine 调用）。
 type roomCtx struct {
 	a *roomActor
@@ -361,18 +372,33 @@ func (r *roomCtx) SetKV(key string, v any) {
 }
 
 // fanOut 编码一次、逐成员投递（广播高效路径，§3.2 扇出）。
+// 成员可能协商不同序列化（JSON/PB）：按会话 codec 分组、每组编码一次再扇出。
+// 绕坑：旧实现硬编码 JSON——PB 客户端收到 JSON body 但 PushEncoded 按会话
+// codec 打 flag，客户端按 PB 解码静默得零值（bot e2e 实测踩坑）。
 func (r *roomCtx) fanOut(msgID framework.MsgID, msg any, snapshot bool, except map[string]bool) {
-	body, err := protocol.MustGet(protocol.TypeJSON).Marshal(msg)
-	if err != nil {
-		return
-	}
 	id := uint32(msgID)
+	type encoded struct {
+		body []byte
+		ok   bool // 区分"编码成功但为空"与"编码失败"（空消息体合法返回 nil）
+	}
+	bodies := make(map[byte]encoded) // codec → 该组编码一次的消息体
 	for _, uid := range r.a.order {
 		if except[uid] {
 			continue
 		}
-		if m, ok := r.a.members[uid]; ok {
-			_ = m.sess.PushEncoded(id, body, snapshot)
+		m, ok := r.a.members[uid]
+		if !ok {
+			continue
+		}
+		c := m.sess.CodecType()
+		e, done := bodies[c]
+		if !done {
+			body, err := protocol.MustGet(c).Marshal(msg)
+			e = encoded{body: body, ok: err == nil}
+			bodies[c] = e
+		}
+		if e.ok {
+			_ = m.sess.PushEncoded(id, e.body, snapshot)
 		}
 	}
 }
@@ -411,6 +437,9 @@ func (r *roomCtx) Every(d time.Duration, fn func()) framework.Handle {
 }
 
 func (r *roomCtx) Storage() framework.Storage { return r.a.mgr.storage }
+
+// ProfileStore 玩家档案存取（§10.4）；未注入时返回 nil。
+func (r *roomCtx) ProfileStore() framework.ProfileStore { return r.a.mgr.profileStore }
 
 func exceptSet(except []string) map[string]bool {
 	if len(except) == 0 {

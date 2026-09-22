@@ -14,6 +14,7 @@ import (
 
 	"github.com/rangame/server/internal/cluster"
 	"github.com/rangame/server/internal/obs"
+	"github.com/rangame/server/pkg/framework"
 )
 
 // newTestServer 创建测试 admin server（含 metrics + exporter + registry + drainFn）。
@@ -23,7 +24,7 @@ func newTestServer(t *testing.T, registry cluster.NodeRegistry, drainFn DrainFn)
 	exporter := obs.NewPrometheusExporter(metrics)
 	obs.RegisterStandard(metrics, exporter)
 
-	srv := NewServer(Config{Addr: "127.0.0.1:0"}, slog.Default(), exporter, registry, drainFn)
+	srv := NewServer(Config{Addr: "127.0.0.1:0"}, slog.Default(), exporter, registry, drainFn, nil)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -167,4 +168,91 @@ func doReq(t *testing.T, srv *Server, method, path, body string) (int, string) {
 	buf := make([]byte, 4096)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode, string(buf[:n])
+}
+
+// stubProfileQuery 用于测试的 ProfileQueryService 桩实现。
+type stubProfileQuery struct {
+	profiles map[string]*framework.PlayerProfile
+}
+
+func (s *stubProfileQuery) Query(ctx context.Context, uid string) (*framework.PlayerProfile, error) {
+	if p, ok := s.profiles[uid]; ok {
+		return p, nil
+	}
+	return &framework.PlayerProfile{UID: uid}, nil // 零值
+}
+
+func (s *stubProfileQuery) BatchQuery(ctx context.Context, uids []string) (map[string]*framework.PlayerProfile, error) {
+	out := make(map[string]*framework.PlayerProfile, len(uids))
+	for _, uid := range uids {
+		p, _ := s.Query(ctx, uid)
+		out[uid] = p
+	}
+	return out, nil
+}
+
+// TestPlayerProfile_Query 离线查询端点（§10.4.3）。
+func TestPlayerProfile_Query(t *testing.T) {
+	stub := &stubProfileQuery{profiles: map[string]*framework.PlayerProfile{
+		"u1": {UID: "u1", Level: 10, Coin: 999},
+	}}
+	srv := newTestServer(t, nil, nil)
+	srv.SetProfileQueryService(stub)
+
+	// 查存在的玩家
+	status, body := doReq(t, srv, "GET", "/admin/players/u1", "")
+	if status != 200 {
+		t.Fatalf("status=%d, want 200; body=%q", status, body)
+	}
+	if !strings.Contains(body, "\"uid\":\"u1\"") || !strings.Contains(body, "999") {
+		t.Fatalf("body mismatch: %q", body)
+	}
+
+	// 查不存在的玩家（应返回零值档案）
+	status, body = doReq(t, srv, "GET", "/admin/players/ghost", "")
+	if status != 200 {
+		t.Fatalf("status=%d, want 200; body=%q", status, body)
+	}
+	if !strings.Contains(body, "\"uid\":\"ghost\"") {
+		t.Fatalf("body should contain zero profile: %q", body)
+	}
+}
+
+// TestPlayerProfile_BatchQuery 批量查询。
+func TestPlayerProfile_BatchQuery(t *testing.T) {
+	stub := &stubProfileQuery{profiles: map[string]*framework.PlayerProfile{
+		"a": {UID: "a", Level: 1},
+		"b": {UID: "b", Level: 2},
+	}}
+	srv := newTestServer(t, nil, nil)
+	srv.SetProfileQueryService(stub)
+
+	status, body := doReq(t, srv, "GET", "/admin/players/x?batch=a,b", "")
+	if status != 200 {
+		t.Fatalf("status=%d, want 200; body=%q", status, body)
+	}
+	if !strings.Contains(body, "profiles") {
+		t.Fatalf("body should contain profiles: %q", body)
+	}
+}
+
+// TestPlayerProfile_NotInjected 未注入查询服务时返回 501。
+func TestPlayerProfile_NotInjected(t *testing.T) {
+	srv := newTestServer(t, nil, nil)
+	// 不调用 SetProfileQueryService
+	status, _ := doReq(t, srv, "GET", "/admin/players/any", "")
+	if status != 501 {
+		t.Fatalf("status=%d, want 501 (Not Implemented)", status)
+	}
+}
+
+// TestPlayerProfile_MethodNotAllowed 非 GET 拒绝。
+func TestPlayerProfile_MethodNotAllowed(t *testing.T) {
+	stub := &stubProfileQuery{}
+	srv := newTestServer(t, nil, nil)
+	srv.SetProfileQueryService(stub)
+	status, _ := doReq(t, srv, "POST", "/admin/players/u1", "")
+	if status != 405 {
+		t.Fatalf("status=%d, want 405", status)
+	}
 }

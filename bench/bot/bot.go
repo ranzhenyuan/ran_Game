@@ -221,6 +221,27 @@ func (b *Bot) SendMatch(module, code string) error {
 	return b.writeFrame(frame)
 }
 
+// SendMove 发送 snake 转向（MsgMove=0x1000，可靠通道）。
+func (b *Bot) SendMove(dir int) error {
+	c, _ := protocol.Get(b.codec)
+	req := struct {
+		Dir int `json:"dir" protobuf:"varint,1,opt,name=dir,proto3"`
+	}{Dir: dir}
+	raw, err := c.Marshal(&req)
+	if err != nil {
+		return err
+	}
+	frame := &transport.Frame{
+		Ver:   transport.ProtocolVer,
+		MsgID: uint32(0x1000), // snake.MsgMove（bot 不 import games 包，保持解耦）
+		Flag:  b.codec,
+		Seq:   b.nextSeq(),
+		Body:  raw,
+	}
+	b.msgsSent.Add(1)
+	return b.writeFrame(frame)
+}
+
 // RecvLoop 持续读取帧并交给 handler。
 func (b *Bot) RecvLoop(ctx context.Context, handler func(f *transport.Frame)) error {
 	for {

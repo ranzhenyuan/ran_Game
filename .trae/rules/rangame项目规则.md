@@ -1,0 +1,9 @@
+- Go 1.24+，模块名：ranGame
+- 分层：gateway(薄) → internal/service → internal/domain → internal/repo
+- 广告模块在 internal/ad，不允许直接操作 user/gold 表，必须走对应 Service 接口
+- 所有外部副作用（发奖励/扣次数/写记录）必须可重放、幂等
+- Redis 用已有 client，不新加连接池配置
+- 不引入新依赖，除非先问人
+- 测试必须用真实 redis 或 miniredis，不允许用 sleep 模拟时间
+- 错误要 wrap：fmt.Errorf("ad complete: %w", err)
+- 不写 // TODO: optimize 这种废话注释

@@ -21,9 +21,9 @@ import (
 
 func main() {
 	addr := flag.String("addr", "ws://127.0.0.1:7001", "WS 服务器地址")
-	scenario := flag.String("scenario", "heartbeat", "场景: heartbeat|broadcast|random|reconnect|all")
-	bots := flag.Int("bots", 50, "连接数")
-	duration := flag.Duration("duration", 10*time.Second, "压测时长")
+	scenario := flag.String("scenario", "heartbeat", "场景: heartbeat|broadcast|random|reconnect|play|all")
+	bots := flag.Int("bots", 50, "连接数（play 场景固定 2）")
+	duration := flag.Duration("duration", 10*time.Second, "压测时长（play 场景为对局超时上限）")
 	codec := flag.String("codec", "pb", "序列化: json|pb")
 	heartbeatMS := flag.Int("heartbeat-ms", 1000, "心跳间隔(ms)")
 	slowPct := flag.Int("slow-pct", 5, "慢消费者百分比(0-100)")
@@ -60,6 +60,23 @@ func main() {
 		Module:       *module,
 		Code:         *code,
 		Logger:       logger,
+	}
+
+	// play 场景：存档链路走查（匹配→对局→结算→断开触发退出强存）。
+	// 输出参局 UID 供 admin /admin/players/{uid} 验证存档。
+	if *scenario == "play" {
+		if *duration < 60*time.Second {
+			*duration = 60 * time.Second // 对局超时兜底要覆盖 grace+sweep
+		}
+		out := bot.RunPlayMatch(context.Background(), cfg)
+		fmt.Printf("[play] finished=%v winner=%q rounds=%d duration=%s\n",
+			out.Finihed, out.Winner, out.Rounds, out.Duration)
+		fmt.Println("uids:")
+		for _, uid := range out.UIDs {
+			fmt.Printf("  %s\n", uid)
+		}
+		fmt.Println("verify: docker exec logic curl -s http://127.0.0.1:7100/admin/players/<uid>")
+		return
 	}
 
 	scenarios := []struct {

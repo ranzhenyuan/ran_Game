@@ -1,0 +1,90 @@
+# Gateway（Deployment，无状态）：接入层 TCP/WS + 一级路由表，可水平扩缩。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: rangame
+  labels: { app: gateway }
+spec:
+  replicas: 2
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # 滚更不掉接入容量
+  selector:
+    matchLabels: { app: gateway }
+  template:
+    metadata:
+      labels: { app: gateway }
+    spec:
+      containers:
+      - name: server
+        image: rangame/server:latest
+        imagePullPolicy: IfNotPresent
+        args: ["-config", "/etc/server/gateway.yaml"]
+        ports:
+        - { containerPort: 7000, name: tcp }      # 客户端接入
+        - { containerPort: 7001, name: ws }       # 客户端接入
+        - { containerPort: 7002, name: internal } # Gateway↔Logic 内部链路（不挂 Service，PodIP 直连）
+        - { containerPort: 7100, name: admin }
+        env:
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        - name: POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }   # internal_advertise_addr 展开用
+        resources:
+          requests: { cpu: 250m, memory: 256Mi }
+          limits: { cpu: "2", memory: 1Gi }
+        # 探针走 /healthz /readyz（无 ipGuard）；/admin/* 由 NetworkPolicy 收口
+        startupProbe:
+          httpGet: { path: /healthz, port: admin }
+          failureThreshold: 30
+          periodSeconds: 2
+        livenessProbe:
+          httpGet: { path: /healthz, port: admin }
+          periodSeconds: 10
+          timeoutSeconds: 2
+        readinessProbe:
+          httpGet: { path: /readyz, port: admin }
+          periodSeconds: 5
+          timeoutSeconds: 2
+          # 会话宽限期 60s：readyz 恢复慢一点无妨，但不允许在排水后仍接新流量
+        lifecycle:
+          preStop:
+            exec:
+              # ① 等 endpoint 摘除传播（客户端不再新连）② SIGTERM 由进程内排空处理
+              command: ["sleep", "10"]
+        volumeMounts:
+        - { name: config, mountPath: /etc/server, readOnly: true }
+      volumes:
+      - name: config
+        configMap: { name: server-config, items: [{ key: gateway.yaml, path: gateway.yaml }] }
+      terminationGracePeriodSeconds: 60   # 无排水语义，覆盖宽限期 + 排空余量
+---
+# 接入 Service：游戏长连接用 SessionAffinity（同源连接固定网关 pod）
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: rangame
+  labels: { app: gateway }
+spec:
+  type: NodePort                # 云上可改 LoadBalancer
+  selector: { app: gateway }
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+  ports:
+  - { name: tcp, port: 7000, targetPort: tcp, nodePort: 30700 }
+  - { name: ws, port: 7001, targetPort: ws, nodePort: 30701 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: rangame
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: gateway }

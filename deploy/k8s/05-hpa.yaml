@@ -1,0 +1,34 @@
+# HPA：按 active_rooms 平均值扩缩 logic（DEPLOY.md 指标表中的 HPA 信号）。
+# Pods metric 需要 custom.metrics.k8s.io —— 安装 prometheus-adapter 并确保
+# /metrics 中的 active_rooms 可被采集。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: logic-snake
+  namespace: rangame
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: logic-snake
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: active_rooms
+      target:
+        type: AverageValue
+        averageValue: "20"
+  behavior:
+    scaleDown:
+      # 扩容快缩容慢：StatefulSet 缩容走排水（每 pod 最长 20m），
+      # stabilization 窗口防抖；K8s 每 10s 只删 1 个 pod，给排水留时间。
+      stabilizationWindowSeconds: 300
+      policies:
+      - { type: Pods, value: 1, periodSeconds: 600 }
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - { type: Pods, value: 2, periodSeconds: 60 }

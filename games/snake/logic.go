@@ -26,13 +26,14 @@ type Logic struct {
 	r   framework.RoomCtx
 	cfg framework.RoomConfig
 
-	snakes   map[string]*snake
-	order    []string
-	food     Point
-	started  bool
-	finished bool
-	tick     int64
-	seed     int64 // 食物位置的确定性伪随机种子
+	snakes      map[string]*snake
+	order       []string
+	food        Point
+	started     bool
+	finished    bool
+	tick        int64
+	seed        int64          // 食物位置的确定性伪随机种子
+	finalScores map[string]int // finish 时快照的终局分数：结算后成员可能先于 OnDestroy 离开（OnLeave 会删 snakes），OnDestroy 回写必须用快照，否则存档丢失
 }
 
 // NewLogic 由模块工厂在创建房间时调用。
@@ -59,6 +60,14 @@ func (g *Logic) OnJoin(r framework.RoomCtx, p framework.Player) {
 	}
 	g.snakes[p.UID()] = s
 	g.order = append(g.order, p.UID())
+
+	// 读取玩家档案累计分数（§10.4.4 / §14 第 5 步）；可据此发放回归奖励或匹配权重
+	if pf := p.Profile(); pf != nil {
+		if v, ok := pf.Extra["snake_total_score"]; ok {
+			// 累计分数可用作匹配评分或奖励发放；此处仅注释示意，未影响本局初始状态
+			_ = v
+		}
+	}
 
 	r.Broadcast(framework.MsgMemberChange, MemberNtf{UID: p.UID(), Event: "join"})
 
@@ -218,6 +227,12 @@ func (g *Logic) broadcastState() {
 // finish 终局：可靠广播结算 → 落库（强一致同步路径）→ 排行榜 → 关房。
 func (g *Logic) finish(winner string) {
 	g.finished = true
+	// 终局分数快照：g.r.Close() 异步销毁房间，期间成员断开触发 OnLeave
+	// 会 delete(g.snakes)，OnDestroy 必须用此快照回写（绕坑：竞态丢存档）。
+	g.finalScores = make(map[string]int, len(g.snakes))
+	for uid, s := range g.snakes {
+		g.finalScores[uid] = s.score
+	}
 	res := ResultNtf{RoomID: g.r.RoomID(), Winner: winner, Rounds: g.tick}
 	g.r.Broadcast(MsgResult, res)
 
@@ -257,7 +272,33 @@ func (g *Logic) OnLeave(r framework.RoomCtx, p framework.Player) {
 
 func (g *Logic) OnEmpty(r framework.RoomCtx) { r.Close() }
 
-func (g *Logic) OnDestroy(framework.RoomCtx) {}
+// OnDestroy 房间销毁时把本局累计分数回写到玩家档案的 extra 字段（§10.4.4 / §14 第 5 步）。
+//
+// 走 ProfileStore.Patch 字段级更新，避免读-改-写竞态；货币类不可走此路径（§10.4.1）。
+// ProfileStore 未注入时（standalone 未配置存储）静默跳过。
+func (g *Logic) OnDestroy(r framework.RoomCtx) {
+	ps := r.ProfileStore()
+	if ps == nil {
+		return
+	}
+	ctx := context.Background()
+	// 优先用 finish 快照；未 finish 即销毁（全员秒退等）回退到在线 snakes
+	scores := g.finalScores
+	if scores == nil {
+		scores = make(map[string]int, len(g.snakes))
+		for uid, s := range g.snakes {
+			scores[uid] = s.score
+		}
+	}
+	for uid, score := range scores {
+		if err := ps.Patch(ctx, uid, map[string]any{
+			"extra.snake_total_score": score,
+		}); err != nil {
+			// 档案写入失败不影响房间销毁；下次登录会读到旧值
+			_ = err
+		}
+	}
+}
 
 // OnTimeout MaxDuration 到期强结算（§8.2 TimeoutLogic 可选实现）。
 func (g *Logic) OnTimeout(r framework.RoomCtx) {

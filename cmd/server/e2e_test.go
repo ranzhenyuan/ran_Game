@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
 	"testing"
 	"time"
 
@@ -323,4 +324,169 @@ func TestSnakeEndToEndWalkthrough(t *testing.T) {
 	}
 
 	// —— 步骤 11：优雅停机由 t.Cleanup 调用 srv.Shutdown 隐式验证（不得卡死）——
+}
+
+// TestProfileEndToEnd 存档链路走查（架构文档 §10.4）：
+// 预置档案 → 登录 Load → 对局结算 OnDestroy Patch（PlayerActor 单写者路由）→
+// 断线宽限到期 OnRelease 退出强存 → admin /admin/players/{uid} 离线查询 →
+// 再登录 Load 读回退出强存的档案。
+func TestProfileEndToEnd(t *testing.T) {
+	cfg := config.Default()
+	cfg.TCP.Addr = "127.0.0.1:0"
+	cfg.WS.Enabled = true
+	cfg.WS.Addr = "127.0.0.1:0"
+	cfg.WS.Path = "/ws"
+	cfg.WS.AllowedOrigins = []string{"*"}
+	cfg.Session.GracePeriod = config.Duration(400 * time.Millisecond)
+	cfg.Session.SweepInterval = config.Duration(100 * time.Millisecond)
+	cfg.Profile.CheckpointInterval = config.Duration(200 * time.Millisecond)
+	cfg.Admin.Addr = "127.0.0.1:0"
+	cfg.Log.Level = "error"
+
+	srv, err := app.Build(&cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		[]framework.GameModule{snake.Module{}})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	srv.Run(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	ctx := context.Background()
+
+	// —— 步骤 1：预置 pb 档案（pa 首次登录为零档）——
+	if err := srv.Store().SetSync(ctx, "player_profile", "pb", &framework.PlayerProfile{
+		UID: "pb", Level: 3, Exp: 42,
+		Extra: map[string]any{"snake_total_score": 7},
+	}); err != nil {
+		t.Fatalf("seed pb: %v", err)
+	}
+
+	// —— 步骤 2：登录（PlayerActor Spawn → Load → SetProfile）——
+	c1 := dial(t, srv)
+	c2 := dial(t, srv)
+	login(t, c1, "pa")
+	login(t, c2, "pb")
+
+	// —— 步骤 3：匹配成桌 ——
+	writeFrame(t, c1, uint32(framework.MsgMatch), 2, map[string]string{"module": "snake", "code": "ranked"})
+	writeFrame(t, c2, uint32(framework.MsgMatch), 2, map[string]string{"module": "snake", "code": "ranked"})
+	waitMatch := func(c *websocket.Conn) {
+		t.Helper()
+		waitFor(t, c, 3*time.Second, func(f *transport.Frame) bool {
+			code, payload := splitEnvelope(f)
+			var e basicEnv
+			return f.MsgID == uint32(framework.MsgMatch) && json.Unmarshal(payload, &e) == nil &&
+				code == 0 && e.RoomID != ""
+		}, nil)
+	}
+	waitMatch(c1)
+	waitMatch(c2)
+
+	// —— 步骤 4：pa 转向上行，约 7 个 Tick 后撞墙结算。
+	// 双端保持在线，验证 OnDestroy Patch 路由到存活 PlayerActor（单写者，§10.4.4）。——
+	writeFrame(t, c1, uint32(snake.MsgMove), 3, map[string]int{"dir": snake.DirUp})
+
+	// —— 步骤 5：等结算；期间持续记录每条蛇的分数（最后一帧 State = 终局分数）——
+	scores := map[string]int{}
+	waitFor(t, c2, 10*time.Second,
+		func(f *transport.Frame) bool { return f.MsgID == uint32(snake.MsgResult) },
+		func(f *transport.Frame) {
+			if f.MsgID != uint32(snake.MsgState) {
+				return
+			}
+			var st snake.StateNtf
+			if json.Unmarshal(f.Body, &st) == nil {
+				for _, s := range st.Snakes {
+					scores[s.UID] = s.Score
+				}
+			}
+		})
+	t.Logf("settled, final scores: %v", scores)
+
+	// waitProfile 轮询直到 profile 满足断言（异步写链路收敛）。
+	waitProfile := func(uid string, check func(framework.PlayerProfile) bool) framework.PlayerProfile {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			var p framework.PlayerProfile
+			err := srv.Store().Get(ctx, "player_profile", uid, &p)
+			if err == nil && check(p) {
+				return p
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("profile %q not settled: err=%v profile=%+v want scores=%v", uid, err, p, scores)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	// —— 步骤 6：结算 Patch 已落库 ——
+	paP := waitProfile("pa", func(p framework.PlayerProfile) bool {
+		return p.Extra["snake_total_score"] == float64(scores["pa"])
+	})
+	pbP := waitProfile("pb", func(p framework.PlayerProfile) bool {
+		return p.Extra["snake_total_score"] == float64(scores["pb"])
+	})
+
+	// —— 步骤 7：双端断开 → 宽限到期 OnRelease → PlayerActor OnStop 退出强存。
+	// 退出强存不得回滚结算 Patch（单写者修复的回归点）。——
+	_ = c1.Close()
+	_ = c2.Close()
+	time.Sleep(900 * time.Millisecond) // grace 400ms + sweep 100ms + 余量
+
+	paP = waitProfile("pa", func(p framework.PlayerProfile) bool {
+		return p.Extra["snake_total_score"] == float64(scores["pa"])
+	})
+	pbP = waitProfile("pb", func(p framework.PlayerProfile) bool {
+		return p.Level == 3 && p.Exp == 42 &&
+			p.Extra["snake_total_score"] == float64(scores["pb"])
+	})
+	if paP.UID != "pa" || pbP.UID != "pb" {
+		t.Fatalf("uid not persisted: pa=%+v pb=%+v", paP, pbP)
+	}
+	t.Logf("after release: pa=%+v pb=%+v", paP, pbP)
+
+	// —— 步骤 8：admin 离线查询（ProfileQueryService + /admin/players/{uid}）——
+	for _, uid := range []string{"pa", "pb"} {
+		resp, err := http.Get("http://" + srv.AdminAddr() + "/admin/players/" + uid)
+		if err != nil {
+			t.Fatalf("admin query %s: %v", uid, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("admin query %s: status=%d body=%s", uid, resp.StatusCode, body)
+		}
+		var got framework.PlayerProfile
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("admin query %s decode: %v body=%s", uid, err, body)
+		}
+		if got.UID != uid {
+			t.Fatalf("admin query %s: got uid=%q", uid, got.UID)
+		}
+		if uid == "pb" && (got.Level != 3 || got.Exp != 42) {
+			t.Fatalf("admin query pb: level/exp mismatch: %+v", got)
+		}
+		if got.Extra["snake_total_score"] != float64(scores[uid]) {
+			t.Fatalf("admin query %s: extra mismatch: got=%v want=%v", uid,
+				got.Extra["snake_total_score"], scores[uid])
+		}
+	}
+
+	// —— 步骤 9：再登录 Load 读回（退出强存的档案必须被下次登录加载，
+	// 否则 checkpoint/退出强存会把 extra 抹掉）——
+	c3 := dial(t, srv)
+	login(t, c3, "pa")
+	time.Sleep(300 * time.Millisecond) // 覆盖一次 checkpoint（Save 已加载副本）
+	_ = c3.Close()
+	time.Sleep(900 * time.Millisecond)
+
+	paP2 := waitProfile("pa", func(p framework.PlayerProfile) bool {
+		return p.Extra["snake_total_score"] == float64(scores["pa"])
+	})
+	t.Logf("re-login roundtrip ok: %+v", paP2)
 }

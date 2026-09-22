@@ -1,0 +1,44 @@
+# NetworkPolicy（Gateway/Logic 拆分后分两条）：
+#   - Gateway：7000/7001 对客户端开放（NodePort 收口）；7002/7100 仅同 namespace
+#   - Logic：不接客户端，7002（内部链路）/7100（运维面）仅同 namespace；
+#            7000/7001 为进程内占位监听，不列入即默认拒绝入站
+# 探针流量由 kubelet（host-network）发起，不受 ingress 策略影响；
+# preStop drain 走 127.0.0.1 本机回环，同样不受限。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: rangame
+spec:
+  podSelector:
+    matchLabels: { app: gateway }
+  policyTypes: [Ingress]
+  ingress:
+  # 客户端接入：不限来源（实际由 Service NodePort/LoadBalancer 收口）
+  - from: []
+    ports:
+    - { protocol: TCP, port: 7000 }
+    - { protocol: TCP, port: 7001 }
+  # 内部链路（Logic 下行回连）+ admin：仅同 namespace
+  - from:
+    - podSelector: {}
+    ports:
+    - { protocol: TCP, port: 7002 }
+    - { protocol: TCP, port: 7100 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: logic-ingress
+  namespace: rangame
+spec:
+  podSelector:
+    matchLabels: { app: logic-snake }
+  policyTypes: [Ingress]
+  ingress:
+  # 内部链路（Gateway 上行转发）+ admin（Prometheus/排水探测）：仅同 namespace
+  - from:
+    - podSelector: {}
+    ports:
+    - { protocol: TCP, port: 7002 }
+    - { protocol: TCP, port: 7100 }

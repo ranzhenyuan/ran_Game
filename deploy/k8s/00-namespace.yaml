@@ -1,0 +1,7 @@
+# 命名空间：全部清单使用 rangame；kustomization 按序 apply
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rangame
+  labels:
+    app.kubernetes.io/part-of: rangame

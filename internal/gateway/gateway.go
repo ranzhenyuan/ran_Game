@@ -37,6 +37,8 @@ type RouteTable interface {
 	Unbind(uid string)
 	// Invalidate 缓存失效（§13.4 节点变更通知触发）。
 	Invalidate(nodeID string)
+	// Close 释放资源（如 Watch 协程）。
+	Close()
 }
 
 // ErrNotRouted 未在路由表中找到节点。
@@ -243,6 +245,7 @@ func NewMemNodeTransport(localID string) *MemNodeTransport {
 
 // Forward 在进程内直接调对端 handler（同进程演进态骨架）。
 func (t *MemNodeTransport) Forward(nodeID string, inner InnerHeader, f *transport.Frame) error {
+	inner.GatewayID = t.localID // 标记来源网关（与 TCPNodeTransport 语义一致）
 	t.mu.RLock()
 	h, ok := t.peers[nodeID]
 	t.mu.RUnlock()
@@ -283,8 +286,8 @@ func (t *MemNodeTransport) RemovePeer(nodeID string) {
 //	下行：NodeTransport.HandleForward → 按 uid 找本地 Conn → 写聚合。
 type Gateway struct {
 	id        string
-	routes    *MemRouteTable
-	transport *MemNodeTransport
+	routes    RouteTable
+	transport NodeTransport
 	registry  cluster.NodeRegistry
 }
 
@@ -298,18 +301,48 @@ func NewGateway(gatewayID string, registry cluster.NodeRegistry) *Gateway {
 	}
 }
 
+// NewGatewayWithTransport 创建 Gateway 并注入自定义 NodeTransport（如 TCPNodeTransport）。
+func NewGatewayWithTransport(gatewayID string, registry cluster.NodeRegistry, tr NodeTransport) *Gateway {
+	return &Gateway{
+		id:        gatewayID,
+		routes:    NewMemRouteTable(registry),
+		transport: tr,
+		registry:  registry,
+	}
+}
+
 // Routes 暴露路由表（Connector 用）。
-func (g *Gateway) Routes() *MemRouteTable { return g.routes }
+func (g *Gateway) Routes() RouteTable { return g.routes }
 
 // Transport 暴露内部 Transport（Connector / Logic 用）。
-func (g *Gateway) Transport() *MemNodeTransport { return g.transport }
+func (g *Gateway) Transport() NodeTransport { return g.transport }
 
 // ID 返回 Gateway ID。
 func (g *Gateway) ID() string { return g.id }
 
-// Close 关闭 Watch 协程。
+// Registry 暴露节点注册表（用于选 Logic 节点）。
+func (g *Gateway) Registry() cluster.NodeRegistry { return g.registry }
+
+// PickLogicNode 从注册表选一个 Active 的 Logic 节点（演进态骨架：轮询第一个）。
+// 真实部署按 §13.6 最少活跃房间加权。
+func (g *Gateway) PickLogicNode() (string, bool) {
+	if g.registry == nil {
+		return "", false
+	}
+	nodes, err := g.registry.List(cluster.RoleLogic, true)
+	if err != nil || len(nodes) == 0 {
+		return "", false
+	}
+	return nodes[0].ID, true
+}
+
+// Close 关闭 Watch 协程；若底层 NodeTransport 持有资源（TCPNodeTransport
+// 的 listener/连接），一并关闭。MemNodeTransport 无资源，断言不命中。
 func (g *Gateway) Close() {
 	g.routes.Close()
+	if cl, ok := g.transport.(interface{ Close() error }); ok {
+		_ = cl.Close()
+	}
 }
 
 // ---------------- 工具 ----------------

@@ -1,0 +1,100 @@
+# Logic（StatefulSet，有状态）：PlayerActor/RoomActor 归属节点，
+# 稳定 node_id（logic-snake-0/1/2）+ PVC WAL + preStop 排水（§13.3）。
+# 每个玩法模块一个 StatefulSet（modules: [snake]），多玩法按此复制并改 4 处：
+#   名称 / node_id 前缀 / modules 列表 / ConfigMap key。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: logic-snake
+  namespace: rangame
+  labels: { app: logic-snake }
+spec:
+  serviceName: logic-snake            # headless：稳定网络身份
+  replicas: 3
+  podManagementPolicy: OrderedReady   # 逐个起，Registry 注册先行
+  selector:
+    matchLabels: { app: logic-snake }
+  template:
+    metadata:
+      labels: { app: logic-snake }
+    spec:
+      # 必须 ≥ cluster.drain_deadline(20m=1200s) + 排空/flush 余量（DEPLOY.md 优雅停机）
+      terminationGracePeriodSeconds: 1250
+      containers:
+      - name: server
+        image: rangame/server:latest
+        imagePullPolicy: IfNotPresent
+        args: ["-config", "/etc/server/logic.yaml"]
+        ports:
+        # Logic 不接客户端：只暴露内部链路 7002 与运维面 7100；
+        # 进程内 7000/7001 为装配占位监听，无 Service/NetworkPolicy 暴露。
+        - { containerPort: 7002, name: internal }
+        - { containerPort: 7100, name: admin }
+        env:
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }   # logic-snake-{ordinal}
+        - name: POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }    # internal_advertise_addr 展开用
+        resources:
+          requests: { cpu: 500m, memory: 512Mi }
+          limits: { cpu: "4", memory: 2Gi }
+        startupProbe:
+          httpGet: { path: /healthz, port: admin }
+          failureThreshold: 30
+          periodSeconds: 2
+        livenessProbe:
+          httpGet: { path: /healthz, port: admin }
+          periodSeconds: 10
+          timeoutSeconds: 2
+        readinessProbe:
+          httpGet: { path: /readyz, port: admin }
+          periodSeconds: 5
+          timeoutSeconds: 2
+        lifecycle:
+          preStop:
+            exec:
+              # 排水语义（§13.3）：阻塞 POST /admin/drain 直到 active_rooms=0
+              # 或 drain_deadline 到期；之后 K8s 发 SIGTERM 走进程内停机排空。
+              # curl 对排水中的 20m 阻塞需放宽自身超时。
+              command:
+              - sh
+              - -c
+              - "curl -sfs -X POST --max-time 1230 'http://127.0.0.1:7100/admin/drain?deadline=20m' || true"
+        volumeMounts:
+        - { name: config, mountPath: /etc/server, readOnly: true }
+        - { name: wal, mountPath: /data/wal, readOnly: false }
+      volumes:
+      - name: config
+        configMap: { name: server-config, items: [{ key: logic.yaml, path: logic.yaml }] }
+  volumeClaimTemplates:
+  - metadata: { name: wal }
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: { requests: { storage: 1Gi } }
+---
+# Headless Service：StatefulSet 稳定网络身份（serviceName 必填）。
+# 仅暴露内部链路 7002 与运维面 7100；Logic 不接客户端（7000/7001 不列入）。
+# 节点间实际拨号地址走 Registry 通告的 ${POD_IP}:7002（懒拨号，不依赖 DNS）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: logic-snake
+  namespace: rangame
+  labels: { app: logic-snake }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true     # 注册早于 ready 也能被解析/探测
+  selector: { app: logic-snake }
+  ports:
+  - { name: internal, port: 7002, targetPort: internal }
+  - { name: admin, port: 7100, targetPort: admin }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: logic-snake
+  namespace: rangame
+spec:
+  minAvailable: 2                    # 3 副本最多同时扰动 1 个（排水已由 preStop 保证有序）
+  selector:
+    matchLabels: { app: logic-snake }

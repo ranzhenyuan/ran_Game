@@ -24,6 +24,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/rangame/server/games/card"
+	"github.com/rangame/server/games/quiz"
 	"github.com/rangame/server/games/snake"
 	"github.com/rangame/server/internal/app"
 	"github.com/rangame/server/internal/cluster"
@@ -53,7 +55,8 @@ func main() {
 	}
 
 	// 玩法模块装配（games 仅依赖 pkg/framework，由 cmd 注入）。
-	modules := []framework.GameModule{snake.Module{}}
+	// 列表索引决定消息 ID 段（0→0x1000, 1→0x1100, 2→0x1200），上线后不得调整顺序。
+	modules := []framework.GameModule{snake.Module{}, card.Module{}, quiz.Module{}}
 
 	// 按 server.role 分派装配（§12.6）。
 	var srv *app.Server
@@ -70,10 +73,12 @@ func main() {
 		}
 		defer registry.Close()
 		cc := app.ClusterConfig{
-			NodeID:        cfg.Cluster.NodeID,
-			Modules:       cfg.Cluster.Modules,
-			DrainDeadline: cfg.Cluster.DrainDeadline.Std(),
-			Registry:      registry,
+			NodeID:                cfg.Cluster.NodeID,
+			Modules:               cfg.Cluster.Modules,
+			DrainDeadline:         cfg.Cluster.DrainDeadline.Std(),
+			Registry:              registry,
+			InternalAddr:          cfg.Cluster.InternalAddr,
+			InternalAdvertiseAddr: cfg.Cluster.InternalAdvertiseAddr,
 		}
 		if cfg.Server.Role == "gateway" {
 			role := cluster.RoleGateway
@@ -86,6 +91,9 @@ func main() {
 		} else {
 			cc.Role = cluster.RoleLogic
 			srv, logicExtra, err = app.BuildLogic(cfg, logger, modules, cc, metrics)
+			if logicExtra != nil && logicExtra.Gateway != nil {
+				defer logicExtra.Gateway.Close()
+			}
 		}
 	default:
 		err = fmt.Errorf("unknown server.role: %q", cfg.Server.Role)

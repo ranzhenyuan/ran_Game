@@ -48,11 +48,19 @@ cluster:                # 集群演进态配置（§12/§13，仅 role=gateway|l
   # redis_addr: "127.0.0.1:6379"  # 注册表 Redis；空=用进程内 MemRegistry（演进态骨架）
   # redis_db: 0
   node_ttl: 15s         # 节点条目 TTL（§13.2）；心跳每 5s 刷新
+  # 内部链路（§12.3）：internal_addr 留空=进程内 MemNodeTransport（同进程骨架/测试）；
+  # 非空=监听 TCP 并启用跨节点转发（K8s 约定 7002）。
+  # internal_addr: ":7002"
+  # 注册到注册表的对端拨号地址，必须对端可达（不能用通配的 :7002）；K8s 注入 "${POD_IP}:7002"
+  # internal_advertise_addr: "127.0.0.1:7002"
 
 admin:                 # 运维面 HTTP server（§11，必须内网，§11.4）
   addr: 127.0.0.1:7100 # 监听地址；K8s 部署用 0.0.0.0:7100 + NetworkPolicy 限制
   # trusted_cidrs:       # 信任的来源 IP CIDR；空表示仅 127.0.0.1
   #   - 10.0.0.0/8
+
+profile:               # 玩家档案/游戏存档（§10.4）
+  checkpoint_interval: 60s  # 周期存档间隔（PlayerActor 自驱动）；<=0 禁用
 
 log:
   level: info           # debug | info | warn | error

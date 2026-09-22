@@ -1,0 +1,58 @@
+# 本机 Docker 冒烟配置（与 deploy/k8s/02-configmap.yaml 的 logic 段同源）。
+# 差异：单实例固定 node_id、trusted_cidrs 增加 docker bridge 网段。
+# WAL 用 --tmpfs /data/wal 挂载（与生产行为一致，无需 PVC）。
+server:
+  role: logic
+tcp:
+  addr: ":7000"
+  read_timeout: 30s
+  write_channel_size: 256
+  write_flush_interval: 2ms
+  max_frame_size: 65536
+  tcp_nodelay: true
+ws:
+  enabled: false                      # Logic 不接客户端（拆分后仅 Gateway 开 WS）
+  addr: ":7001"
+  path: "/ws"
+  allowed_origins:
+    - "*"
+  read_timeout: 30s
+  write_channel_size: 256
+  max_frame_size: 65536
+session:
+  grace_period: 60s
+  replay_buffer: 256
+  heartbeat_ms: 15000
+  max_login_body: 4096
+  sweep_interval: 5s
+storage:
+  driver: redis                      # 业务存储走 redis（验证真实写回链路）
+  redis_addr: "redis:6379"
+  writeback_queue: 4096
+  flush_interval: 10ms
+  flush_batch: 256
+  flush_retry: 2
+  wal_path: "/data/wal"              # docker run --tmpfs /data/wal
+  breaker_cooldown: 5s
+  sync_timeout: 2s
+cluster:
+  node_id: "logic-snake-local"
+  modules:
+    - snake
+  redis_addr: "redis:6379"
+  internal_addr: ":7002"             # 节点间内部链路监听
+  internal_advertise_addr: "logic:7002"    # docker network 容器名
+  drain_deadline: 20m
+  node_ttl: 15s
+admin:
+  addr: 0.0.0.0:7100
+  trusted_cidrs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12                  # docker bridge（本地冒烟专用）
+    - 127.0.0.0/8
+profile:
+  checkpoint_interval: 60s
+log:
+  level: info
+pprof:
+  enabled: false

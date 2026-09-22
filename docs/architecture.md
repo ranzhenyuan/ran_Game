@@ -1,6 +1,8 @@
 # 通用小游戏后端框架 — 架构设计文档
 
-> 版本：v0.4（设计稿）　|　语言：Go 1.22+　|　状态：本期仅设计，不含实现
+> 版本：v0.5（设计稿）　|　语言：Go 1.22+　|　状态：本期仅设计，不含实现
+>
+> v0.5 补充：玩家档案/游戏存档（§10.4：ProfileStore 接口、PlayerProfile 混合字段、周期 checkpoint + 退出强存、离线查询服务、PlayerActor 集成点、故障降级、schema）。
 >
 > v0.4 补充：多 module 混部容量估算示例（§13.10：成本单位模型、单节点瓶颈推导、HPA 阈值与副本数、排水余量校验）。
 >
@@ -505,6 +507,7 @@ type Ranking interface {
 |------|------|------|
 | 会话/重连 token、排行榜 | Redis | TTL 天然匹配宽限期；ZSet 天然匹配排行 |
 | 账号、资产流水、对局记录 | MySQL | 强一致 + 可审计 |
+| **玩家档案**（等级/货币/成就/设置/extra，§10.4） | Redis（热数据 Hash + JSON）+ MySQL（兜底强一致） | 玩家不在线时仍需查询（§10.4.3）；登录加载走 Redis，结算/退出强存双写 |
 | 房间内实时状态 | **只存内存**（RoomActor） | 换取性能；靠第 5 章宽限期 + 玩法定义的恢复策略兜底 |
 
 - **异步写回**：Actor 内调 `Storage.Set` 实际入写回队列（有界），后台批量 flush；写失败重试 + 死信日志。Actor 内**永不同步等 IO**；
@@ -519,6 +522,118 @@ type Ranking interface {
 | MySQL 不可用 | 异步写回阻塞 | 写回队列（有界）堆积 → 触发溢出策略（下） |
 | 写回队列溢出 | 持久化丢失风险 | 二级降级：① 溢出数据落**本地 WAL**（追加写，进程恢复后重放）；② WAL 也失败 → 死信日志 + **熔断**（按 table 拒绝新的异步写入，业务收降级错误码），防内存无界增长 |
 | 熔断恢复 | — | 半开探测：后台探测成功自动恢复；熔断期间的内存态由业务决策重试或丢弃（资产类建议配合对账） |
+
+### 10.4 玩家档案（PlayerProfile / 游戏存档）
+
+§10.1–10.3 给出的是**通用 KV/计数/排行**抽象，没有"玩家档案"概念：玩家不在线时无统一查询入口、登录时无加载钩子、退出时无强存保证。本节补这一层。
+
+**定位**：玩家档案 = 跨会话持久化的玩家级数据（等级/货币/成就/设置/游戏内进度等），与对局历史（§10.2 表中"对局记录"）正交。档案随 uid 而非随房间存在。
+
+#### 10.4.1 接口抽象
+
+```go
+// ProfileStore 玩家档案存取接口（业务内调用，PlayerActor goroutine 内访问）
+type ProfileStore interface {
+    // Load 登录或重连时加载档案；不存在返回零值档案（首次登录）
+    Load(ctx context.Context, uid string) (*PlayerProfile, error)
+    // Save 增量写入（走 §10.2 异步队列）
+    Save(ctx context.Context, uid string, p *PlayerProfile) error
+    // SaveSync 强一致写入（走 §10.2 Sync 变体）；OnRelease/结算等关键路径使用
+    SaveSync(ctx context.Context, uid string, p *PlayerProfile) error
+    // Patch 部分字段更新（避免读-改-写竞态）
+    Patch(ctx context.Context, uid string, fields map[string]any) error
+}
+
+// PlayerProfile 通用档案结构（混合字段策略）
+type PlayerProfile struct {
+    UID       string         `json:"uid" protobuf:"bytes,1,opt,name=uid,proto3"`
+    Level     int32          `json:"level" protobuf:"varint,2,opt,name=level,proto3"`
+    Exp       int64          `json:"exp" protobuf:"varint,3,opt,name=exp,proto3"`
+    Coin      int64          `json:"coin" protobuf:"varint,4,opt,name=coin,proto3"`  // 货币类强一致，走 IncrBy 而非直接赋值
+    Gem       int64          `json:"gem" protobuf:"varint,5,opt,name=gem,proto3"`
+    Settings  map[string]any `json:"settings,omitempty" protobuf:"bytes,6,opt,name=settings,proto3"`  // 客户端设置
+    Achievements []string    `json:"achievements,omitempty" protobuf:"bytes,7,rep,name=achievements,proto3"`
+    Extra     map[string]any `json:"extra,omitempty" protobuf:"bytes,8,opt,name=extra,proto3"`  // 玩法自定义扩展面
+    UpdatedAt int64          `json:"updated_at" protobuf:"varint,9,opt,name=updated_at,proto3"`  // ms 时间戳，单调性校验
+}
+```
+
+- **混合字段策略**：通用字段（Level/Exp/Coin/Gem/Achievements）所有玩法共享；`Extra map[string]any` 留给玩法自定义（如蛇蛇的累计长度、卡牌的卡组清单）；
+- **货币类禁止直接赋值**：Coin/Gem 等资产类必须走 `Storage.IncrBy`（原子计数），不能 `Save` 整个档案覆盖（避免读-改-写竞态丢失扣款）；
+- **UpdatedAt 单调性**：并发写入时用 CAS 检查 UpdatedAt，旧值覆盖新值直接拒绝。
+
+#### 10.4.2 落库语义：周期 checkpoint + 退出强存
+
+| 时机 | 路径 | 说明 |
+|------|------|------|
+| 登录/重连 | `Load` | PlayerActor `OnSessionStart` 加载到内存态，玩法通过 `Player.Profile()` 读 |
+| 游戏内修改 | 内存态 + `Save`（异步） | 不阻塞 Actor；走 §10.2 写回队列 |
+| 周期 checkpoint | `Save`（异步） | 每 N 秒（玩法配置，默认 60s）兜底刷一次，防长时间未存档的崩溃丢失 |
+| 玩家退出/被顶号 | `SaveSync`（强存） | `PlayerActor.OnRelease` 强制同步落库 + WAL 兜底，保证不丢档 |
+| 房间结算 | `SaveSync` 或 `Patch` | `RoomLogic.OnDestroy` 内对参与玩家结算后强存（与 §10.2 "对局记录"同步写） |
+
+- **周期 checkpoint 由 PlayerActor 自驱动**（用 §9 定时器 `Every`），不依赖外部扫描；
+- **退出强存超时**：`SaveSync` 受 `Storage.SyncTimeout` 约束（默认 2s），超时按 §10.3 熔断/WAL 兜底；
+- **WAL 兜底生效条件**：`Storage.wal_path` 配置非空；存档 table 命名约定 `player_profile`（统一表名，便于运维识别与对账）。
+
+#### 10.4.3 离线查询入口（独立查询服务）
+
+业务内查询通过 `Player.Profile()`（PlayerActor goroutine 内）即可；玩家不在线时需独立查询服务：
+
+```go
+// ProfileQueryService 独立查询服务接口（玩家不在线时使用）
+// 实现方式：① admin HTTP API（/admin/players/{uid}）；② 独立 gRPC 服务
+// 安全基线：仅内网/可信调用方访问（§11.4 ipGuard + mTLS）
+type ProfileQueryService interface {
+    Query(ctx context.Context, uid string) (*PlayerProfile, error)
+    BatchQuery(ctx context.Context, uids []string) (map[string]*PlayerProfile, error)
+    Leaderboard(ctx context.Context, metric string, limit int) ([]RankItem, error)
+}
+```
+
+- **不读 PlayerActor**：玩家不在线时 PlayerActor 不存在，直接查 Storage；
+- **缓存层**：高频查询可加进程内 LRU（与 §10.2 Redis 缓存正交），TTL 由业务定；
+- **依赖方向**：查询服务依赖 `Storage` 接口，不依赖 `internal/actor`，避免循环。
+
+#### 10.4.4 PlayerActor 集成点
+
+| 钩子 | 调用 | 说明 |
+|------|------|------|
+| `OnSessionStart(uid)` | `profileStore.Load` → 写入 PlayerActor 内存态 | 登录/重连统一入口，幂等 |
+| `Every(checkpointInterval)` | `profileStore.Save` | 周期 checkpoint |
+| `OnRelease()` | `profileStore.SaveSync` | 退出强存（顶号/宽限超时/主动下线）|
+| `RoomLogic.OnDestroy` | `profileStore.Patch` 或 `SaveSync` | 房间结算回写档案 |
+
+- **`OnRelease` 必须强存**：避免顶号场景下旧 PlayerActor 退出但档案未落库，新 PlayerActor `Load` 拿到旧值；
+- **顶号顺序**：旧 PlayerActor `OnRelease`（强存）→ 新 PlayerActor `OnSessionStart`（Load 拿到最新值）→ 旧连接被踢（§4.3 ErrKicked 2004）。顺序由 `SessionManager.TopKick` 保证。
+
+#### 10.4.5 故障与降级
+
+| 故障 | 行为 |
+|------|------|
+| `Load` 失败（Redis/MySQL 不可用） | 登录**直接失败**（不降级绕过，与会话 token 同口径 §10.3） |
+| `Save` 异步入队失败 | 走 §10.3 写回队列溢出 → WAL 兜底 |
+| `SaveSync` 超时 | WAL 兜底 + 熔断（按 `player_profile` table）；玩家退出被阻塞至超时，可接受 |
+| WAL 也失败 | 死信日志 + 告警；玩家内存态仍可用，下次登录重新加载（可能丢失最后一次修改） |
+
+#### 10.4.6 数据模型（参考 schema）
+
+MySQL DDL 示例（Redis 走 Hash + JSON 序列化）：
+
+```sql
+CREATE TABLE player_profile (
+    uid        VARCHAR(64)  PRIMARY KEY,
+    level      INT          NOT NULL DEFAULT 1,
+    exp        BIGINT       NOT NULL DEFAULT 0,
+    coin       BIGINT       NOT NULL DEFAULT 0,
+    gem        BIGINT       NOT NULL DEFAULT 0,
+    settings   JSON         NULL,
+    achievements JSON       NULL,
+    extra      JSON         NULL,
+    updated_at BIGINT       NOT NULL DEFAULT 0,
+    INDEX idx_updated (updated_at)
+);
+```
 
 ---
 
@@ -573,7 +688,24 @@ flowchart LR
 
 ## 12. 网关层设计（Gateway / Logic 拆分演进）
 
-> 定位：本期为**单机架构**，网关功能内嵌于进程（即 §3 接入层 + §5 会话 + §6 路由）。本章定义规模/可用性超出单进程上限时的**拆分演进设计**——即 §16.3 演进预留点的完整展开。核心约束：**对游戏业务代码零改动**（Module/RoomLogic/Actor 接口不变，仅装配入口与部署拓扑变化）。
+> 定位：框架默认形态为**单机架构**，网关功能内嵌于进程（即 §3 接入层 + §5 会话 + §6 路由）。本章定义规模/可用性超出单进程上限时的**拆分演进设计**——即 §16.3 演进预留点的完整展开。核心约束：**对游戏业务代码零改动**（Module/RoomLogic/Actor 接口不变，仅装配入口与部署拓扑变化）。
+>
+> **实现状态（截至当前）**：拆分骨架已落地并通过真实 TCP 双节点端到端测试，可按 `deploy/k8s/` 清单部署：
+>
+> | 能力 | 状态 | 实现落点 |
+> |------|------|---------|
+> | 角色分派装配（gateway/logic） | ✅ | `app.BuildGateway` / `app.BuildLogic`（`server.role`） |
+> | 一级路由表（进程内） | ✅ 骨架 | `gateway.MemRouteTable`（uid→nodeID，watch 注册表失效） |
+> | 一级路由表（Redis 共享） | ⏳ 下一阶段 | 多 Gateway 副本前提；当前双副本需待 RedisRouteTable |
+> | 内部 Transport（进程内） | ✅ | `MemNodeTransport`（同进程骨架直达） |
+> | 内部 Transport（真实 TCP） | ✅ | `TCPNodeTransport`，`cluster.internal_addr` 非空启用 |
+> | Gateway 侧收发 | ✅ | `app.GatewayConnector`：登录选节点/业务帧转发/下行回写/心跳直回 |
+> | Logic 侧收发 | ✅ | `app.LogicHandler`：登录建会话、重连重放、业务帧进 router |
+> | Logic 侧下行端点 | ✅ | `session.RemoteConn`（实现 `transport.Conn`，Push 经内部链路回传） |
+> | 重连节点路由 | ✅ | 重连 token = `nodeID:原始token`；无前缀时广播 Active 节点兜底 |
+> | LogicDown 主动通知 | ⏳ | 注册表 Down 事件已能 Invalidate 本地表；客户端通知待下一阶段 |
+> | ConnSession/PlayerSession 显式拆分 | ⏳ | 当前以 GatewayConnector + RemoteConn 两个端点承担同等职责，业务语义不变 |
+
 
 ### 12.1 何时需要拆分
 
@@ -620,8 +752,20 @@ flowchart LR
 
 ### 12.3 内部协议（Gateway ↔ Logic）
 
-- **复用 §4.1 帧格式**，帧头前增加内部路由段 `innerHeader`：`{uid, sessionID, gatewayID, msgType: Unicast|RoomBroadcast}`；该段仅存在于内部链路，对客户端不可见；
+- **复用 §4.1 帧格式**，帧头前增加内部路由段 `innerHeader`：`{uid, sessionID, gatewayID, msgType: Unicast|RoomBroadcast, forwardSeq}`；该段仅存在于内部链路，对客户端不可见；
 - 内部连接是 `Transport` 接口的又一实现（node-to-node Transport），与客户端 WS/TCP 实现共享帧编解码与写聚合机制；
+
+**实现约定（当前落地形态）**：
+
+| 项 | 约定 |
+|----|------|
+| 传输 | `gateway.TCPNodeTransport`：每节点一个 TCP 监听（K8s 约定容器端口 **7002**），对端懒拨号 + 长连接复用；`cluster.internal_addr` 留空则退回进程内 `MemNodeTransport`（同进程骨架/集成测试） |
+| 线格式 | `[4B 大端 payloadLen][innerHeader 文本前缀 "uid\|sessID\|gwID\|msgType\|seq\n"][§4.1 原始帧]`；多 envelope 可在同一 TCP 段聚合，接收方按长度前缀切流 |
+| 写聚合 | 与客户端连接同机制：首帧触发 2ms 攒批窗口 / 4KB 上限；出站写失败自动清连接重拨一次 |
+| 断连检测 | 每连接一个只读协程消费数据：TCP 半关闭下写可能先进内核缓冲，读 EOF 是唯一可靠关闭信号，检测到即标记连接死亡 |
+| 寻址 | 节点不预拨号簿：目标地址查 NodeRegistry 注册条目的 `Addr`（即 `internal_advertise_addr`，K8s 注入 `${POD_IP}:7002`）；监听地址 `:7002` 是通配形式，不能作为拨号目标 |
+| 入站分发 | 入站帧按发送方 nodeID（转发时加盖的来源 ID）查具名 handler；对端副本动态扩缩无法预注册，故另有"默认 handler"兜底——GatewayConnector 与 LogicHandler 均注册为各自节点的默认入口 |
+
 - **下行广播扇出**两种模式（配置切换）：
 
 | 模式 | 机制 | 适用 |
@@ -632,9 +776,12 @@ flowchart LR
 ### 12.4 会话路由与粘性
 
 - **路由表**：`{module}:uid → LogicNode` 存 Redis + Gateway 本地缓存；登录/重连时由 Logic 写入。分配策略见 §13.6（粘性不迁移 + 新房按最少活跃房间加权），取代简单一致性哈希——弹性场景节点增减不搬迁存量会话；
+  - **当前实现**：`MemRouteTable` 为进程内映射（演进骨架），登录成功后由 **GatewayConnector** 写入本地表；Logic 侧尚不需要写（同进程/单网关副本下路由表就在 Gateway 本地）。升级为多 Gateway 副本时按本节契约改为 Redis 共享表、写入主体迁回 Logic（会话建立的唯一知情方），Gateway 退为只读 + 短 TTL 本地缓存；
+  - 骨架阶段 Gateway 登录时需解析登录请求体取 uid 以建立下行连接索引，属"哑管道"原则的**唯一例外**（仅登录帧、仅取 uid 字段，不触碰玩法 body）；
 - **按玩法分区**：路由键带 module 维度，snake/card 等玩法可落到独立 Logic 集群、独立 HPA（§13.6）；
 - **同房同节点**：房间类玩法要求同房成员在同一 Logic 进程——`RoomManager` 分配 roomID 时写 `roomID → node`，Gateway 对房间消息按 roomID 路由；跨节点组房由 MatchMaker 在分配时完成成员落点（不让房间运行中迁移）；
-- **Logic 宕机**：节点心跳超时 → Gateway 向该节点全部会话下发 `LogicDown` 错误码 → 客户端静默重连（走 §5 重连通道）→ 新节点恢复；账号/资产态在 Redis/MySQL 不丢，房间实时态按 §10.2 的取舍处理。
+- **Logic 宕机**：节点心跳超时 → Gateway 向该节点全部会话下发 `LogicDown` 错误码 → 客户端静默重连（走 §5 重连通道）→ 新节点恢复；账号/资产态在 Redis/MySQL 不丢，房间实时态按 §10.2 的取舍处理。当前已落地：注册表 Down 事件 → 路由表 `Invalidate(nodeID)` 清除指向该节点的映射；主动下发 LogicDown 通知待下一阶段；
+- **重连路由**：Logic 登录响应中的 `reconnect_token` 形如 `nodeID:原始token`，Gateway 重连时直接按前缀路由到原 Logic 节点，不查路由表；前缀缺失（旧 token/异常）时广播到全部 Active Logic 节点由其校验，成功即恢复。
 
 ### 12.5 滚动发版（发布重启不掉线）
 
@@ -662,6 +809,29 @@ flowchart LR
 - **上行**：C → Gateway 帧头解析 → 查一级路由表 → 内部链路 → Logic Router（§6 不变）→ Actor 邮箱（§7 不变）
 - **下行**：Actor `session.Push()` → 内部链路（Unicast / RoomBroadcast）→ Gateway 按 uid 找 Conn → 写聚合 flush（§3 不变）
 
+**当前落地的完整数据流**（同进程骨架用 `MemNodeTransport` 直达，跨 Pod 用 `TCPNodeTransport`，二者实现同一接口）：
+
+```
+客户端 → GatewayConnector.ServeConn
+  ├─ login:  Gateway.PickLogicNode → Forward(nodeID) → LogicHandler.handleLogin
+  │          └─ Logic: sessions.Create(uid, RemoteConn) → 回 LoginResp(token=nodeID:原始token)
+  │          └─ Gateway: 写响应客户端 +（骨架阶段）Routes.Bind(uid, nodeID) + conns[uid]=本地Conn
+  ├─ ping:   Gateway 直接回 Pong，不进内部链路（§5.2）
+  ├─ reconnect: token 前缀解析 nodeID → Forward；无前缀则广播 Active 节点兜底
+  │          └─ Logic: 剥前缀 → sessions.Reconnect → 回响应 + 可靠帧/快照重放
+  └─ 业务帧: Routes.Lookup(uid) → Forward(nodeID) → LogicHandler.dispatch
+             └─ Logic: sessions.Get(uid) → router.Dispatch（§6 全链路不变）
+
+下行: PlayerActor/RoomActor → sess.Send → RemoteConn.Push
+      → Forward(innerHeader.gatewayID) → GatewayConnector.handleDownlink
+      → conns[uid] 查本地连接（握手响应先唤醒 pending 请求通道）→ 写聚合
+```
+
+关键实现约束（踩坑后固化）：
+- `Forward` 必须在 innerHeader 上加盖**本端 nodeID**（`GatewayID` 字段语义为"帧来源网关"），否则对端无法回传——Mem/TCP 两种实现语义必须一致；
+- Gateway 侧 uid→本地连接索引必须在转发登录请求**之前**建立：响应在 `Forward` 调用栈内同步（Mem）或紧接着（TCP）就会到达，晚注册会丢下行响应；
+- Logic 不直接监听客户端端口（部署清单中 7000/7001 仅为复用装配的占位监听，无 Service/NetworkPolicy 暴露），客户端只进 Gateway。
+
 > 端到端新增一跳内部转发（同机房 P99 < 1ms）；§15 性能目标在拆分态按 Logic 侧口径重新计量。
 
 ---
@@ -686,12 +856,17 @@ flowchart LR
 - **节点注册表**（Redis，Gateway/Logic 共用发现机制）：
 
 ```
-cluster:nodes:{role}  → Hash{ nodeID: {addr, modules[], state, activeRooms, startedAt, lastBeat} }
-                        TTL 15s；心跳每 5s 刷新；状态变更立即发布
-cluster:nodes:change  → Pub/Sub 频道（拓扑/状态变更主动通知，见 §13.4）
+cluster:node:{id}     STRING（JSON：{addr, modules[], state, activeRooms, startedAt, lastBeat}）
+                      每节点独立 key + TTL 15s；心跳每 5s 刷新；状态变更立即发布
+cluster:nodes:change  Pub/Sub 频道（拓扑/状态变更主动通知，见 §13.4）
+                      ListByRole 以 SCAN cluster:node:* + 客户端过滤实现
 ```
 
-- Logic 启动 → 自检通过 → 注册为 `Active`；Gateway 启动注册后从注册表发现 Logic 列表。
+> 设计稿原为 `cluster:nodes:{role}` 单 Hash + 按 field TTL；实现简化为每节点独立 key（Hash 不支持单 field TTL，独立 key 崩溃节点可自动过期）。
+>
+> 注册条目中的 `addr` 在拆分部署下是**内部链路通告地址**（`cluster.internal_advertise_addr`，K8s 为 `${POD_IP}:7002`），即其他节点 TCPNodeTransport 的懒拨号目标；不能填监听用的通配地址 `:7002`。
+
+- Logic 启动 → 内部链路监听就绪 → 注册为 `Active`；Gateway 启动注册后从注册表发现 Logic 列表。
 - K8s 环境下**注册数据可由 Endpoints + Pod 标签/annotation 替代**（state 写 annotation/condition），二选一，接口一致。
 
 ### 13.3 节点状态机与排水缩容
@@ -778,12 +953,17 @@ preStop → readiness 失败(LB/Endpoints 摘新流) → 等待端点传播(3~10
 | 项 | Gateway | Logic |
 |----|---------|-------|
 | 工作负载 | Deployment | **StatefulSet**（稳定 nodeID） |
+| 暴露端口 | 7000/7001（客户端 Service NodePort）+ 7002（仅 PodIP 内部）+ 7100 | **仅 7002**（PodIP 内部）+ 7100；7000/7001 为占位监听不暴露 |
+| 身份/地址注入 | `POD_NAME`（随机身份）、`POD_IP`（内部通告） | `POD_NAME=logic-{module}-{ordinal}`、`POD_IP`（fieldRef） |
 | readinessProbe | 与 Logic 连通性 | **Draining 返回 503** |
 | preStop | 摘流等待端点传播 → 分批 4005 → 连接归零 | 调 `/admin/drain` 置 Draining → 轮询等待 `active_rooms=0` |
-| terminationGracePeriodSeconds | 120 | **≥ 排水截止时间**（默认 1500s = 25min） |
+| terminationGracePeriodSeconds | 120 | **≥ 排水截止时间 + 余量**（清单取 1250s = 20min deadline + 50s） |
 | PDB | — | `maxUnavailable: 1`（自愿中断期间不全缩） |
 | HPA | 自定义指标：连接数占比 | 自定义指标（prometheus-adapter）：`active_rooms` 均值、mailbox P95 |
+| NetworkPolicy | 7000/7001 对外、7002/7100 限同 namespace | 7002/7100 限同 namespace，其余默认拒绝 |
 | 配置 | — | `DRAIN_DEADLINE = max(MaxDuration) + grace` |
+
+可直接 apply 的清单在 `deploy/k8s/00~06-*.yaml`；7002 不挂 Service——节点间按注册表通告的 PodIP 懒拨号，headless Service 仅承担 StatefulSet 稳定身份（`serviceName` 必填）与运维面暴露。
 
 Logic 缩容时序：
 
@@ -948,6 +1128,37 @@ func main() {
 ```
 
 **扩展点总览**：Codec、Transport（未来换 gnet/netpoll）、Storage（新后端）、MatchMaker、中间件、Module——全部为接口注册式，不改框架内核。
+
+**第 5 步（可选）：玩法自定义档案字段**
+
+`PlayerProfile.Extra` 是玩法自定义扩展面（§10.4.1），无需改框架结构。在 `OnJoin` 通过 `Player.Profile()` 读取，`OnDestroy` 通过 `RoomCtx.ProfileStore().Patch()` 回写：
+
+```go
+func (s *SnakeGame) OnJoin(r framework.RoomCtx, p framework.Player) {
+    if pf := p.Profile(); pf != nil {
+        if extra := pf.Extra["snake_total_len"]; extra != nil {
+            // 用累计长度做奖励发放
+        }
+    }
+}
+
+func (s *SnakeGame) OnDestroy(r framework.RoomCtx) {
+    ps := r.ProfileStore()
+    if ps == nil {
+        return // 未配置档案存取
+    }
+    for _, p := range r.Members() {
+        totalLen := /* 本局累计 */
+        _ = ps.Patch(context.Background(), p.UID(), map[string]any{
+            "extra.snake_total_len": totalLen,
+        })
+    }
+}
+```
+
+- **Player.Profile() 只读**：返回快照指针，**不可修改**（§10.4.1）；修改走 `ProfileStore.Patch`；
+- **禁止覆盖主档案**：`Extra` 通过 `Patch` 字段级更新，不能整档案 `Save`（避免读-改-写竞态，§10.4.1）；
+- **货币类不可走 Extra**：Coin/Gem 等资产必须走 `Storage.IncrBy`（§10.4.1 货币类约束）。
 
 ---
 

@@ -1,0 +1,50 @@
+# 本机 Docker 冒烟配置（与 deploy/k8s/02-configmap.yaml 的 gateway 段同源）。
+# 差异：node_id 固定、admin.trusted_cidrs 增加 docker bridge 网段 172.16.0.0/12
+#（K8s pod CIDR 是 10.x，无需此项；不加会被 ipGuard 403）。
+server:
+  role: gateway
+tcp:
+  addr: ":7000"
+  read_timeout: 30s
+  write_channel_size: 256
+  write_flush_interval: 2ms
+  max_frame_size: 65536
+  tcp_nodelay: true
+ws:
+  enabled: true
+  addr: ":7001"
+  path: "/ws"
+  allowed_origins:
+    - "*"                            # 本机冒烟；生产必须白名单（见 k8s configmap）
+  read_timeout: 30s
+  write_channel_size: 256
+  max_frame_size: 65536
+session:
+  grace_period: 60s
+  replay_buffer: 256
+  heartbeat_ms: 15000
+  max_login_body: 4096
+  sweep_interval: 5s
+storage:
+  driver: memory                     # gateway 无业务落库
+  wal_path: ""
+  sync_timeout: 2s
+cluster:
+  node_id: "gw-local"
+  redis_addr: "redis:6379"           # docker network 容器名解析
+  internal_addr: ":7002"             # 节点间内部链路监听
+  internal_advertise_addr: "gateway:7002"  # docker network 容器名（与 redis:6379 同源约定）
+  drain_deadline: 20m
+  node_ttl: 15s
+admin:
+  addr: 0.0.0.0:7100
+  trusted_cidrs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12                  # docker bridge（本地冒烟专用）
+    - 127.0.0.0/8
+profile:
+  checkpoint_interval: 60s
+log:
+  level: info
+pprof:
+  enabled: false

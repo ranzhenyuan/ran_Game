@@ -1,0 +1,44 @@
+# Redis：集群三依赖（NodeRegistry 节点注册 / RedisMatcher 匹配队列 / DrainController）
+# 单副本 demo 部署；生产替换为托管 Redis 或 Sentinel/Cluster。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: rangame
+  labels: { app: redis }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        args: ["--appendonly", "yes"]           # 注册表/匹配队列重启不丢
+        ports:
+        - { containerPort: 6379, name: redis }
+        resources:
+          requests: { cpu: 50m, memory: 64Mi }
+          limits: { cpu: "1", memory: 256Mi }
+        livenessProbe:
+          tcpSocket: { port: redis }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket: { port: redis }
+          initialDelaySeconds: 3
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: rangame
+  labels: { app: redis }
+spec:
+  selector: { app: redis }
+  ports:
+  - { port: 6379, targetPort: redis, name: redis }

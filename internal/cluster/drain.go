@@ -142,6 +142,26 @@ func (d *drainController) WaitDrained(ctx context.Context) error {
 		close(done)
 	}()
 
+	// 兜底轮询：notifyRoomChange 需要 room.Manager → DrainController 反向接线，
+	// 演进态骨架未接（生产零调用）。定期 Broadcast 让 waiter 重新检查
+	// roomsSrc/sessionsSrc，否则"进排水时还有对局"的节点会挂满整个 deadline
+	//（K8s preStop curl 卡死，缩容/滚更退化成 20m/pod）。绕坑：K8s 演练实测。
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	go func() {
+		for {
+			select {
+			case <-poll.C:
+				d.cond.Broadcast()
+			case <-done:
+				return
+			case <-ctx.Done():
+				d.cond.Broadcast()
+				return
+			}
+		}
+	}()
+
 	select {
 	case <-done:
 		return nil

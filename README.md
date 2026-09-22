@@ -9,7 +9,7 @@
 - **双通道下行**：可靠帧进 ring buffer 重放，快照帧 latest-wins 不重放
 - **协议无关 Codec**：JSON / Protobuf 协商，下行沿用会话上行类型
 - **存储降级链路**：异步队列 + 批量 flush + WAL 兜底 + 熔断器
-- **演进态集群骨架**：gateway/logic 角色 + NodeRegistry + DrainController + RedisMatcher（单进程内可验证）
+- **Gateway/Logic 拆分已接线**：gateway/logic 角色 + NodeRegistry + DrainController + RedisMatcher；GatewayConnector↔LogicHandler 经内部 Transport（进程内直达 / TCP 7002 跨 Pod），`deploy/k8s/` 可直接部署
 - **可观测性内置**：Prometheus 文本导出 + admin API（healthz/readyz/drain/nodes/metrics）+ traceID 透传
 - **零外部依赖压测客户端**：bench/bot 四场景（心跳/广播/随机负载/断线重连）
 
@@ -32,17 +32,16 @@ cmd/server          单机/gateway/logic 入口（按 server.role 分派）
 cmd/benchbot        压测客户端 CLI
 configs/server.yaml 配置
 docs/               架构文档与模块拆解
-
 pkg/framework/      稳定 API 面（GameModule/Storage/MatchRule/MsgID/ErrCode）
 games/snake/        内置示例玩法（仅依赖 pkg/framework）
 
 internal/
   actor/            Actor 引擎（单 goroutine 串行 + 有界邮箱 + 监督）
   admin/            运维面 HTTP API
-  app/              装配入口（Build / BuildGateway / BuildLogic）
+  app/              装配入口（Build / BuildGateway / BuildLogic + GatewayConnector/LogicHandler）
   cluster/          集群演进态（NodeRegistry / DrainController / RedisMatcher）
   config/           YAML 配置
-  gateway/          一级路由表 + 内部 Transport
+  gateway/          一级路由表（Mem/Redis 演进）+ 内部 Transport（Mem/TCP）
   match/            匹配器（进程内 Maker + Matcher 接口）
   obs/              可观测性（metrics/prometheus/trace/logger/pprof）
   protocol/         帧编解码 + Codec 注册表（JSON/Protobuf）
@@ -97,14 +96,14 @@ go mod tidy
 | `tcp` / `ws` | 接入层监听地址与超时 |
 | `session` | 宽限期 / ring buffer / 心跳 / 登录帧上限 |
 | `storage` | driver（memory/redis/sqlite/mysql）+ 队列/WAL/熔断参数 |
-| `cluster` | node_id / modules / drain_deadline / redis_addr / node_ttl |
+| `cluster` | node_id / modules / drain_deadline / redis_addr / node_ttl / internal_addr / internal_advertise_addr |
 | `admin` | 运维面 HTTP 地址 + trusted_cidrs |
 | `log` / `pprof` | 日志级别 + pprof 端点 |
 
 ## 演进态角色
 
 ```yaml
-# 单机（默认）
+# 单机（默认，internal_addr 留空=进程内直达）
 server:
   role: standalone
 
@@ -114,17 +113,23 @@ server:
 cluster:
   node_id: "gw-0"
   redis_addr: "127.0.0.1:6379"
+  internal_addr: ":7002"                          # 内部链路监听
+  internal_advertise_addr: "127.0.0.1:7002"       # K8s 用 "${POD_IP}:7002"
 
 # 集群 logic
 server:
   role: logic
+ws:
+  enabled: false                                   # Logic 不接客户端
 cluster:
   node_id: "logic-snake-0"
   modules: [snake]
   redis_addr: "127.0.0.1:6379"
+  internal_addr: ":7002"
+  internal_advertise_addr: "127.0.0.1:7002"
 ```
 
-`redis_addr` 留空时用进程内 MemRegistry（单进程集成测试用）。
+`redis_addr` 留空时用进程内 MemRegistry；`internal_addr` 留空时用进程内 MemNodeTransport（两者均用于单进程集成测试）。K8s 部署见 [DEPLOY.md](DEPLOY.md) 与 `deploy/k8s/`。
 
 ## 文档
 

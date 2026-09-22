@@ -22,12 +22,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/rangame/server/internal/cluster"
 	"github.com/rangame/server/internal/obs"
+	"github.com/rangame/server/pkg/framework"
 )
 
 // Server admin HTTP 服务器。
@@ -36,9 +38,10 @@ type Server struct {
 	listener   net.Listener
 	logger     *slog.Logger
 	exporter   *obs.PrometheusExporter
-	registry   cluster.NodeRegistry // 可空：standalone 形态
-	ready      atomic.Value         // readyz 探针：true=就绪
-	drainFn    DrainFn              // 可空：logic 角色排水触发回调
+	registry   cluster.NodeRegistry          // 可空：standalone 形态
+	profileQ   framework.ProfileQueryService // 可空：未注入时 /admin/players 返回 501
+	ready      atomic.Value                  // readyz 探针：true=就绪
+	drainFn    DrainFn                       // 可空：logic 角色排水触发回调
 	mu         sync.Mutex
 	closed     bool
 }
@@ -66,12 +69,14 @@ func NewServer(
 	exporter *obs.PrometheusExporter,
 	registry cluster.NodeRegistry,
 	drainFn DrainFn,
+	profileQ framework.ProfileQueryService,
 ) *Server {
 	s := &Server{
 		logger:   logger,
 		exporter: exporter,
 		registry: registry,
 		drainFn:  drainFn,
+		profileQ: profileQ,
 	}
 	s.ready.Store(false)
 
@@ -81,6 +86,7 @@ func NewServer(
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/admin/nodes", s.ipGuard(s.handleNodes))
 	mux.HandleFunc("/admin/drain", s.ipGuard(s.handleDrain))
+	mux.HandleFunc("/admin/players/", s.ipGuard(s.handlePlayerProfile))
 
 	s.httpServer = &http.Server{
 		Handler:           s.withRecover(mux),
@@ -91,6 +97,14 @@ func NewServer(
 	}
 
 	return s
+}
+
+// Addr 返回实际监听地址（":0" 随机端口测试用；未启动时返回配置地址）。
+func (s *Server) Addr() string {
+	if s.listener != nil {
+		return s.listener.Addr().String()
+	}
+	return s.httpServer.Addr
 }
 
 // Start 启动 HTTP 监听；非阻塞，返回 listener 错误。
@@ -119,6 +133,13 @@ func (s *Server) SetDrainFn(fn DrainFn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.drainFn = fn
+}
+
+// SetProfileQueryService 注入玩家档案查询服务（Build 在 storage 装配后注入，§10.4.3）。
+func (s *Server) SetProfileQueryService(q framework.ProfileQueryService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.profileQ = q
 }
 
 // Shutdown 优雅停机。
@@ -213,6 +234,54 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "drained"})
+}
+
+// handlePlayerProfile 查询玩家档案（离线查询入口，§10.4.3）。
+//
+//	GET /admin/players/{uid}
+//	GET /admin/players/{uid}?batch=uid1,uid2  批量查询
+func (s *Server) handlePlayerProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+		return
+	}
+	if s.profileQ == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error":   "profile_query_unavailable",
+			"message": "profile query service not injected",
+		})
+		return
+	}
+
+	// /admin/players/{uid}
+	uid := strings.TrimPrefix(r.URL.Path, "/admin/players/")
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "uid required"})
+		return
+	}
+
+	// 批量查询
+	if batch := r.URL.Query().Get("batch"); batch != "" {
+		uids := strings.Split(batch, ",")
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		profiles, err := s.profileQ.BatchQuery(ctx, uids)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	p, err := s.profileQ.Query(ctx, uid)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 // ---------------- 中间件 ----------------

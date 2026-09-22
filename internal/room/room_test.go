@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rangame/server/internal/actor"
+	"github.com/rangame/server/internal/protocol"
 	"github.com/rangame/server/internal/room"
 	"github.com/rangame/server/internal/session"
 	"github.com/rangame/server/internal/storage"
@@ -71,7 +72,7 @@ type recLogic struct {
 }
 
 type pushMsg struct {
-	V int `json:"v"`
+	V int `json:"v" protobuf:"varint,1,opt,name=v,proto3"`
 }
 
 const msgTest framework.MsgID = 0x1000
@@ -97,7 +98,7 @@ func (l *recLogic) OnEmpty(r framework.RoomCtx) {
 }
 func (l *recLogic) OnDestroy(r framework.RoomCtx) { l.destroy.Add(1) }
 
-func setup(t *testing.T, logic *recLogic, maxPlayers int) (*actor.Engine, *session.Manager, *room.Manager) {
+func setup(t *testing.T, logic framework.RoomLogic, maxPlayers int) (*actor.Engine, *session.Manager, *room.Manager) {
 	t.Helper()
 	eng := actor.New(actor.Config{})
 	t.Cleanup(func() {
@@ -122,8 +123,14 @@ func setup(t *testing.T, logic *recLogic, maxPlayers int) (*actor.Engine, *sessi
 
 func createSess(t *testing.T, sm *session.Manager, uid string) (*session.Session, *fakeConn) {
 	t.Helper()
+	return createSessCodec(t, sm, uid, protocol.TypeJSON)
+}
+
+// createSessCodec 指定协商 codec 建会话（0=JSON, 1=PB）。
+func createSessCodec(t *testing.T, sm *session.Manager, uid string, codec byte) (*session.Session, *fakeConn) {
+	t.Helper()
 	c := newFakeConn()
-	sess, _ := sm.Create(uid, c, 0)
+	sess, _ := sm.Create(uid, c, codec)
 	return sess, c
 }
 
@@ -174,6 +181,72 @@ func TestRoomJoinBroadcastAndSnapshot(t *testing.T) {
 		t.Fatal("tick not fired")
 	}
 	_ = eng
+}
+
+// structJoinLogic 进房即广播 struct 消息（混合 codec 回归用）。
+type structJoinLogic struct {
+	recLogic
+}
+
+func (l *structJoinLogic) OnJoin(r framework.RoomCtx, p framework.Player) {
+	r.Broadcast(msgTest, pushMsg{V: 7})
+}
+
+// TestRoomBroadcastPerMemberCodec 回归：广播必须按各成员协商的序列化分别编码。
+// 旧 fanOut 硬编码 JSON——PB 成员收到 JSON body 但 flag 标 PB，解码静默得零值。
+func TestRoomBroadcastPerMemberCodec(t *testing.T) {
+	logic := &structJoinLogic{recLogic: recLogic{t: t}}
+	_, sm, mgr := setup(t, logic, 4)
+
+	roomID, err := mgr.CreateRoom("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, c1 := createSess(t, sm, "p1")                             // JSON 成员
+	s2, c2 := createSessCodec(t, sm, "p2", protocol.TypeProtobuf) // PB 成员
+	_, _ = s1, s2
+	if err := mgr.Join(roomID, "p1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Join(roomID, "p2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// p1 收 2 条（p1/p2 各自 join 广播）；p2 收 1 条（p2 的）
+	waitLen(t, c1, 2)
+	waitLen(t, c2, 1)
+
+	// PB 成员：flag codec=PB 且 body 可按 PB 解出
+	pbFrames := filterFrames(c2.frames(), uint32(msgTest))
+	if len(pbFrames) != 1 {
+		t.Fatalf("pb member should receive 1 broadcast, got %d", len(pbFrames))
+	}
+	if got := pbFrames[0].CodecType(); got != protocol.TypeProtobuf {
+		t.Fatalf("pb member frame codec = %d, want %d", got, protocol.TypeProtobuf)
+	}
+	var pbGot pushMsg
+	if err := protocol.MustGet(protocol.TypeProtobuf).Unmarshal(pbFrames[0].Body, &pbGot); err != nil {
+		t.Fatalf("pb decode: %v", err)
+	}
+	if pbGot.V != 7 {
+		t.Fatalf("pb decoded V = %d, want 7", pbGot.V)
+	}
+
+	// JSON 成员：flag codec=JSON 且 body 可按 JSON 解出
+	jFrames := filterFrames(c1.frames(), uint32(msgTest))
+	if len(jFrames) != 2 {
+		t.Fatalf("json member should receive 2 broadcasts, got %d", len(jFrames))
+	}
+	if got := jFrames[0].CodecType(); got != protocol.TypeJSON {
+		t.Fatalf("json member frame codec = %d, want %d", got, protocol.TypeJSON)
+	}
+	var jGot pushMsg
+	if err := protocol.MustGet(protocol.TypeJSON).Unmarshal(jFrames[0].Body, &jGot); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if jGot.V != 7 {
+		t.Fatalf("json decoded V = %d, want 7", jGot.V)
+	}
 }
 
 func TestRoomFull(t *testing.T) {

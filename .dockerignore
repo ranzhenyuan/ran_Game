@@ -1,0 +1,21 @@
+# 构建上下文最小化：镜像只需要 go.mod/go.sum + Go 源码
+.git
+.gitignore
+.vscode
+.idea
+
+# 文档与部署清单（不进镜像）
+*.md
+docs/
+deploy/
+
+# 本地产物与临时文件
+*.exe
+*.test
+*.out
+bin/
+data/
+*.log
+
+# CI 与编辑器配置
+.github/

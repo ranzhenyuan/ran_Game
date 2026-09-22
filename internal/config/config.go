@@ -32,10 +32,17 @@ type Config struct {
 	WS      WSConfig      `yaml:"ws"`
 	Session SessionConfig `yaml:"session"`
 	Storage StorageConfig `yaml:"storage"`
+	Profile ProfileConfig `yaml:"profile"`
 	Cluster ClusterConfig `yaml:"cluster"`
 	Admin   AdminConfig   `yaml:"admin"`
 	Log     LogConfig     `yaml:"log"`
 	PProf   PProfConfig   `yaml:"pprof"`
+}
+
+// ProfileConfig 玩家档案/游戏存档配置（§10.4）。
+type ProfileConfig struct {
+	// CheckpointInterval 周期存档间隔（§10.4.2，默认 60s）；<=0 禁用周期 checkpoint。
+	CheckpointInterval Duration `yaml:"checkpoint_interval"`
 }
 
 // AdminConfig 运维面 HTTP server 配置（§11）。
@@ -66,6 +73,14 @@ type ClusterConfig struct {
 	RedisDB int `yaml:"redis_db"`
 	// NodeTTL 节点条目 TTL（§13.2，默认 15s）。
 	NodeTTL Duration `yaml:"node_ttl"`
+	// InternalAddr Gateway↔Logic 内部链路监听地址（§12.3，如 ":7002"）。
+	// 空=用进程内 MemNodeTransport（同进程骨架/集成测试）；
+	// 非空=启动 TCPNodeTransport，跨 Pod 真实转发。
+	InternalAddr string `yaml:"internal_addr"`
+	// InternalAdvertiseAddr 注册到 NodeRegistry 的对端可达地址 host:port。
+	// 空=用 InternalAddr；K8s 用 "${POD_IP}:7002" 注入（fieldRef status.podIP），
+	// 因为监听地址 :7002 是通配形式，不能作为其他节点的拨号目标。
+	InternalAdvertiseAddr string `yaml:"internal_advertise_addr"`
 }
 
 type TCPConfig struct {
@@ -177,6 +192,9 @@ func Default() Config {
 			DrainDeadline: Duration(20 * time.Minute),
 			NodeTTL:       Duration(15 * time.Second),
 		},
+		Profile: ProfileConfig{
+			CheckpointInterval: Duration(60 * time.Second),
+		},
 		Admin: AdminConfig{
 			Addr: "127.0.0.1:7100",
 		},
@@ -184,6 +202,9 @@ func Default() Config {
 }
 
 // Load 从 path 读取 YAML 配置，未显式给出的字段沿用 Default。
+// 支持 ${VAR} 环境变量展开（K8s 用 fieldRef 注入 node_id 等 per-Pod 值，
+// 兑现 DEPLOY.md "node_id 建议用环境变量注入 logic-snake-${POD_NAME}"）；
+// 未定义变量展开为空串，配置中不应出现裸 $ 字符。
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -191,7 +212,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := Default()
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
 
@@ -274,6 +295,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Cluster.NodeTTL.Std() <= 0 {
 			return fmt.Errorf("cluster.node_ttl must be positive")
+		}
+		if c.Cluster.InternalAdvertiseAddr != "" && c.Cluster.InternalAddr == "" {
+			return fmt.Errorf("cluster.internal_addr is required when internal_advertise_addr is set")
 		}
 	}
 	return nil

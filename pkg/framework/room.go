@@ -31,6 +31,9 @@ type Player interface {
 	Push(msgID MsgID, msg any) error
 	// PushSnapshot 快照通道单推（per-msgID latest-wins）。
 	PushSnapshot(msgID MsgID, msg any) error
+	// Profile 读取玩家档案快照（只读，§10.4.1）；返回 *PlayerProfile 不可修改。
+	// 快照由 PlayerActor OnSessionStart 加载，通过 atomic.Pointer 安全暴露给 RoomActor。
+	Profile() *PlayerProfile
 }
 
 // RoomCtx 房间上下文。所有方法仅允许在 RoomActor 自己的 goroutine 内调用（免锁，§7.3）。
@@ -57,6 +60,9 @@ type RoomCtx interface {
 	Every(d time.Duration, fn func()) Handle
 
 	Storage() Storage
+	// ProfileStore 玩家档案存取接口（§10.4）；RoomLogic 在 OnDestroy 结算时
+	// 通过此接口 Patch/SaveSync 回写玩家档案（如 extra 累计字段、成就解锁）。
+	ProfileStore() ProfileStore
 }
 
 // RoomLogic 游戏开发者唯一必须实现的业务接口（§8.1）。

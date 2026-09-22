@@ -66,3 +66,31 @@ func TestValidateRejectsBadDuration(t *testing.T) {
 		t.Fatal("invalid duration should fail")
 	}
 }
+
+// TestLoadExpandsEnvVars K8s 部署依赖：${VAR} 环境变量展开（node_id per-Pod 注入）。
+func TestLoadExpandsEnvVars(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "env.yaml")
+	content := `
+server:
+  role: logic
+cluster:
+  node_id: "logic-${POD_NAME}"
+  modules: [snake]
+  drain_deadline: 1m
+tcp:
+  addr: ":7000"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("POD_NAME", "snake-2")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Cluster.NodeID != "logic-snake-2" {
+		t.Fatalf("env expansion failed: node_id=%q", cfg.Cluster.NodeID)
+	}
+}

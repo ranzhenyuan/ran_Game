@@ -1,0 +1,114 @@
+# 双角色配置（同一镜像按 -config 参数分派）。
+# ${POD_NAME} 由 config.Load 的 os.ExpandEnv 展开（K8s fieldRef 注入），
+# StatefulSet 每副本得到稳定唯一 node_id。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: server-config
+  namespace: rangame
+data:
+  # ---------- Gateway（Deployment，无状态） ----------
+  gateway.yaml: |
+    server:
+      role: gateway
+    tcp:
+      addr: ":7000"
+      read_timeout: 30s
+      write_channel_size: 256
+      write_flush_interval: 2ms
+      max_frame_size: 65536
+      tcp_nodelay: true
+    ws:
+      enabled: true
+      addr: ":7001"
+      path: "/ws"
+      allowed_origins:
+        - "https://game.example.com"   # 生产必改：真实前端 Origin；"*" 仅限压测
+      read_timeout: 30s
+      write_channel_size: 256
+      max_frame_size: 65536
+    session:
+      grace_period: 60s
+      replay_buffer: 256
+      heartbeat_ms: 15000
+      max_login_body: 4096
+      sweep_interval: 5s
+    storage:
+      driver: memory                   # gateway 不落业务数据；接入层会话态在内存
+      wal_path: ""                     # gateway 禁用 WAL
+      sync_timeout: 2s
+    cluster:
+      node_id: "gw-${POD_NAME}"        # Deployment 无状态：pod 名即身份，重启生成新 ID 可接受
+      redis_addr: "redis:6379"         # NodeRegistry（必须 Redis）
+      internal_addr: ":7002"           # Gateway↔Logic 内部链路监听（§12.3，不对外暴露）
+      internal_advertise_addr: "${POD_IP}:7002"  # 注册到 Registry 的对端拨号地址（fieldRef 注入）
+      drain_deadline: 20m
+      node_ttl: 15s
+    admin:
+      addr: 0.0.0.0:7100               # K8s 探针/排水要求非 loopback；由 NetworkPolicy 收口
+      trusted_cidrs:
+        - 10.0.0.0/8                   # 集群 Pod CIDR，生产按实际改
+    profile:
+      checkpoint_interval: 60s
+    log:
+      level: info
+    pprof:
+      enabled: false
+
+  # ---------- Logic（StatefulSet，有状态：PlayerActor/RoomActor 归属） ----------
+  logic.yaml: |
+    server:
+      role: logic
+    tcp:
+      # Logic 不直接服务客户端：7000 仅进程内装配占位监听，
+      # 无 Service/NetworkPolicy 对外暴露；客户端只经 Gateway 接入。
+      addr: ":7000"
+      read_timeout: 30s
+      write_channel_size: 256
+      write_flush_interval: 2ms
+      max_frame_size: 65536
+      tcp_nodelay: true
+    ws:
+      enabled: false                     # Logic 不接客户端 WS（拆分红线）
+      addr: ":7001"
+      path: "/ws"
+      allowed_origins:
+        - "https://game.example.com"
+      read_timeout: 30s
+      write_channel_size: 256
+      max_frame_size: 65536
+    session:
+      grace_period: 60s
+      replay_buffer: 256
+      heartbeat_ms: 15000
+      max_login_body: 4096
+      sweep_interval: 5s
+    storage:
+      driver: redis                    # 业务存储复用同一 Redis（生产切 mysql 强一致兜底）
+      redis_addr: "redis:6379"
+      writeback_queue: 4096
+      flush_interval: 10ms
+      flush_batch: 256
+      flush_retry: 2
+      wal_path: "/data/wal"            # PVC 挂载：队列溢出/熔断期间落盘
+      breaker_cooldown: 5s
+      sync_timeout: 2s
+    cluster:
+      node_id: "${POD_NAME}"             # POD_NAME=logic-snake-0/1/2 即稳定身份（勿再叠前缀，避免双前缀）
+      modules:
+        - snake                        # 本节点服务模块；多玩法按模块拆 StatefulSet
+      redis_addr: "redis:6379"
+      internal_addr: ":7002"           # Gateway↔Logic 内部链路监听（§12.3）
+      internal_advertise_addr: "${POD_IP}:7002"  # PodIP 直连；心跳 5s 刷新，重建后自动收敛
+      drain_deadline: 20m              # 与 terminationGracePeriodSeconds=1250 配对
+      node_ttl: 15s
+    admin:
+      addr: 0.0.0.0:7100
+      trusted_cidrs:
+        - 10.0.0.0/8
+    profile:
+      checkpoint_interval: 60s         # PlayerActor 周期存档
+    log:
+      level: info
+    pprof:
+      enabled: false

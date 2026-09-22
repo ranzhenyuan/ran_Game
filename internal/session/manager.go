@@ -222,6 +222,9 @@ func (m *Manager) OnlineCount() int {
 	return len(m.byUID)
 }
 
+// HeartbeatMS 返回配置的心跳间隔（登录响应下发用）。
+func (m *Manager) HeartbeatMS() int { return m.cfg.HeartbeatMS }
+
 // destroy 彻底销毁会话（宽限期超时路径）。
 func (m *Manager) destroy(sess *Session, reason string) {
 	if !m.removeFromMaps(sess) {
@@ -253,7 +256,7 @@ func (m *Manager) kickAndDestroy(sess *Session, reason string) {
 	_ = sess.PushReliable(framework.MsgKick, notice)
 
 	m.mu.Lock()
-	if t := sess.currentToken(); t != "" && m.byToken[t] == sess {
+	if t := sess.Token(); t != "" && m.byToken[t] == sess {
 		delete(m.byToken, t)
 	}
 	if c := sess.currentConn(); c != nil && m.byConn[c.ID()] == sess {
@@ -284,7 +287,7 @@ func (m *Manager) removeFromMaps(sess *Session) bool {
 		return false
 	}
 	delete(m.byUID, sess.UID())
-	if t := sess.currentToken(); t != "" {
+	if t := sess.Token(); t != "" {
 		delete(m.byToken, t)
 	}
 	if c := sess.currentConn(); c != nil {

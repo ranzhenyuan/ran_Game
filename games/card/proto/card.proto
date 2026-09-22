@@ -1,0 +1,52 @@
+// card 模块协议规范文档（§14 推荐配套；手写 ProtoCodec 与 Go struct 的
+// protobuf tag 保持一致，本文件仅作规范参考，不参与编译）。
+syntax = "proto3";
+
+package card;
+
+// 消息段：ModuleBase(1) = 0x1100
+enum MsgID {
+  MSG_PLAY   = 0x1100; // 上行出牌（可靠）
+  MSG_ROUND  = 0x1101; // 下行回合结果（可靠广播）
+  MSG_RESULT = 0x1102; // 下行结算（可靠广播）
+  MSG_DEAL   = 0x1103; // 下行开局发牌（可靠单推）
+}
+
+message PlayReq {
+  int32 idx = 1; // 手牌下标
+}
+
+message Card {
+  int32 point = 1; // 1-13
+}
+
+message DealNtf {
+  repeated Card hand = 1;
+  int32 total_rounds = 2;
+}
+
+message PlayNtf {
+  string uid = 1;
+  Card card = 2;
+  bool win = 3;    // 唯一最高点者 true；平局双方均 true 仅展示
+  int32 score = 4; // 保留字段（当前未填）
+}
+
+message RoundNtf {
+  int32 round = 1;        // 1 起
+  repeated PlayNtf plays = 2;
+  bool is_last = 3;
+}
+
+message ScoreNtf {
+  string uid = 1;
+  int32 score = 2;
+}
+
+message ResultNtf {
+  string room_id = 1;
+  string winner = 2; // 空=平局
+  int32 rounds = 3;
+  repeated ScoreNtf scores = 4;
+  bool timeout = 5; // MaxDuration 到期强结算
+}

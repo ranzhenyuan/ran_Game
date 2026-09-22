@@ -1,0 +1,38 @@
+// quiz 模块协议规范文档（§14 推荐配套；手写 ProtoCodec 与 Go struct 的
+// protobuf tag 保持一致，本文件仅作规范参考，不参与编译）。
+syntax = "proto3";
+
+package quiz;
+
+// 消息段：ModuleBase(2) = 0x1200
+enum MsgID {
+  MSG_ANSWER   = 0x1200; // 上行答题（可靠）
+  MSG_QUESTION = 0x1201; // 下行出题（可靠广播）
+  MSG_RESULT   = 0x1202; // 下行结算（可靠广播）
+}
+
+message AnswerReq {
+  int32 idx = 1;    // 题号（0 起）
+  int32 option = 2; // 选项下标
+}
+
+message QuestionNtf {
+  int32 idx = 1;
+  string text = 2;
+  repeated string options = 3;
+  int32 time_limit_ms = 4; // 超时服务端自动跳题
+  int32 total = 5;
+}
+
+message ScoreNtf {
+  string uid = 1;
+  int32 score = 2;
+}
+
+message ResultNtf {
+  string room_id = 1;
+  string winner = 2; // 空=平局
+  repeated ScoreNtf scores = 3;
+}
+
+// 说明：正确答案 Answer 字段仅在服务端 Bank 内存在，不下发。

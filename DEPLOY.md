@@ -29,6 +29,8 @@ go build -o bin/server ./cmd/server
 | admin `127.0.0.1:7100` | 运维面 HTTP（healthz/readyz/drain/nodes/metrics） |
 | pprof `127.0.0.1:6060` | Go pprof 端点 |
 
+> 演进态 gateway/logic 角色另有内部链路端口 **7002**（`cluster.internal_addr`，仅拆分部署启用，不对客户端暴露）。
+
 ### 存储后端切换
 
 ```yaml
@@ -58,7 +60,7 @@ go run ./cmd/benchbot -scenario all -bots 100 -duration 30s -addr ws://127.0.0.1
 
 ## 演进态集群（gateway + logic）
 
-**架构文档 §49 约束**：当前阶段不实现真实多进程集群跨节点长连接。演进态骨架在单进程内验证设计可行性；真实部署需补 node-to-node Transport。
+Gateway/Logic 拆分已落地：真实跨节点链路（TCPNodeTransport）已接线并经双节点端到端测试，`deploy/k8s/` 提供可直接 apply 的完整清单。当前限制：一级路由表为进程内实现（多 Gateway 副本下的共享路由表为下一阶段交付），生产多副本部署前关注此前提。
 
 ### 角色分派
 
@@ -67,17 +69,28 @@ go run ./cmd/benchbot -scenario all -bots 100 -duration 30s -addr ws://127.0.0.1
 server:
   role: gateway
 cluster:
-  node_id: "gw-0"
-  redis_addr: "127.0.0.1:6379"   # 留空=进程内 MemRegistry（测试用）
+  node_id: "gw-0"                        # K8s Deployment 建议 "gw-${POD_NAME}"
+  redis_addr: "127.0.0.1:6379"           # 留空=进程内 MemRegistry（测试用）
+  internal_addr: ":7002"                 # 内部链路监听；留空=进程内 MemTransport（同进程骨架）
+  internal_advertise_addr: "10.0.0.11:7002"  # 注册到注册表的对端拨号地址；K8s 用 "${POD_IP}:7002"
 
 # logic 节点
 server:
   role: logic
 cluster:
   node_id: "logic-snake-0"
-  modules: [snake]               # 本节点服务的玩法
+  modules: [snake]                       # 本节点服务的玩法
   redis_addr: "127.0.0.1:6379"
+  internal_addr: ":7002"
+  internal_advertise_addr: "10.0.0.21:7002"
 ```
+
+| 配置项 | 说明 |
+|--------|------|
+| `internal_addr` | 内部链路监听地址（约定 7002）。空 = 进程内 MemNodeTransport，Gateway/Logic 同进程直达（骨架/集成测试） |
+| `internal_advertise_addr` | 注册到 NodeRegistry 的地址，其他节点按此懒拨号。必须填对端可达地址，**不能**留 `:7002`（通配地址无法拨号）；K8s 由 `POD_IP` 环境变量注入 |
+
+Logic 侧 `ws.enabled` 应置 `false`：Logic 不接客户端，7000/7001 仅为复用单机装配的占位监听。
 
 ### Redis 依赖
 
@@ -90,112 +103,63 @@ cluster:
 ### 部署拓扑
 
 ```
-                ┌─────────────────────────────────┐
-                │       Gateway (Deployment)      │
-                │  - 接入层（TCP/WS）              │
-                │  - 一级路由表（uid → nodeID）    │
-                │  - 转发到 Logic 节点            │
-                └────────────┬────────────────────┘
-                             │  node-to-node Transport
-                ┌────────────┴────────────────────┐
-                │                                  │
-       ┌────────┴────────┐               ┌──────────┴───────┐
-       │ Logic snake-0  │      ...      │ Logic snake-N    │
-       │ (StatefulSet)  │               │ (StatefulSet)    │
-       │ PlayerActor     │               │ PlayerActor     │
-       │ RoomActor       │               │ RoomActor        │
-       └────────┬────────┘               └──────────┬───────┘
-                │                                   │
-                └─────────────┬─────────────────────┘
-                              │
-                    ┌─────────┴─────────┐
-                    │   Redis           │
-                    │  - NodeRegistry   │
-                    │  - RedisMatcher   │
-                    │  - DrainController│
-                    └───────────────────┘
+客户端
+  │  TCP :30700 / WS :30701（NodePort）
+  ▼
+┌──────────────────────────────────────┐
+│   Gateway (Deployment ×2，无状态)     │
+│  - 接入层（TCP 7000 / WS 7001）       │
+│  - 一级路由表（uid → logicNodeID）    │
+│  - GatewayConnector：转发/下行回写    │
+└───────────────┬──────────────────────┘
+                │  内部链路 TCP 7002（PodIP 懒拨号，不挂 Service）
+┌───────────────┴──────────────────────┐
+│  Logic snake (StatefulSet ×3)        │
+│  - LogicHandler + session.RemoteConn │
+│  - PlayerActor / RoomActor / Router  │
+│  - 仅 7002 / 7100 对集群内暴露        │
+└───────────────┬──────────────────────┘
+                │
+┌───────────────┴──────────────────────┐
+│  Redis                               │
+│  - NodeRegistry（cluster:node:{id}） │
+│  - RedisMatcher                      │
+│  - DrainController                   │
+└──────────────────────────────────────┘
 ```
 
 ### K8s 部署
 
-#### Logic（StatefulSet）
+完整可 apply 清单在 [`deploy/k8s/`](deploy/k8s/)，按序号执行：
 
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: logic-snake
-spec:
-  serviceName: logic-snake
-  replicas: 3
-  selector:
-    matchLabels: { app: logic-snake }
-  template:
-    metadata:
-      labels: { app: logic-snake }
-    spec:
-      terminationGracePeriodSeconds: 1250   # 必须 ≥ cluster.drain_deadline（20m=1200s）
-      containers:
-      - name: server
-        image: rangame/server:latest
-        args: ["-config", "/etc/server/server.yaml"]
-        ports:
-        - { containerPort: 7000, name: tcp }
-        - { containerPort: 7001, name: ws }
-        - { containerPort: 7100, name: admin }
-        env:
-        - name: POD_ORDINAL
-          valueFrom: { fieldRef: { fieldPath: metadata.name } }
-        volumeMounts:
-        - { name: config, mountPath: /etc/server }
-        - { name: wal, mountPath: /data/wal }
-        lifecycle:
-          preStop:
-            exec:
-              command: ["curl", "-X", "POST", "http://127.0.0.1:7100/admin/drain"]
-  volumeClaimTemplates:
-  - metadata: { name: wal }
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources: { requests: { storage: 1Gi } }
-  volumes:
-  - name: config
-    configMap: { name: server-config }
+| 文件 | 内容 |
+|------|------|
+| `00-namespace.yaml` | namespace `rangame` |
+| `01-redis.yaml` | Registry/匹配/存储共用 Redis（生产替换为托管实例） |
+| `02-configmap.yaml` | `gateway.yaml` / `logic.yaml` 两份配置（已含 internal_addr、POD_IP 注入模板） |
+| `03-gateway.yaml` | Deployment×2 + 客户端 Service（NodePort 30700/30701） |
+| `04-logic-snake.yaml` | StatefulSet×3 + headless Service（仅 7002/7100） |
+| `05-hpa.yaml` | 按 active_rooms 弹性 |
+| `06-networkpolicy.yaml` | gateway/logic 两条入站策略 |
+
+```powershell
+kubectl apply -f deploy/k8s/00-namespace.yaml
+kubectl apply -f deploy/k8s/01-redis.yaml
+kubectl apply -f deploy/k8s/02-configmap.yaml
+kubectl apply -f deploy/k8s/03-gateway.yaml
+kubectl apply -f deploy/k8s/04-logic-snake.yaml
+kubectl apply -f deploy/k8s/05-hpa.yaml
+kubectl apply -f deploy/k8s/06-networkpolicy.yaml
 ```
 
-`node_id` 建议用环境变量注入 `logic-snake-${POD_ORDINAL}`，保证 StatefulSet 稳定。
+关键装配点（清单已内置，自写清单时勿漏）：
 
-#### Gateway（Deployment）
+- 两个工作负载均注入 `POD_NAME`（`metadata.name`）与 `POD_IP`（`status.podIP`），配置中 `node_id: "${POD_NAME}"`、`internal_advertise_addr: "${POD_IP}:7002"` 由进程展开环境变量；
+- Gateway 容器端口 7000/7001/7002/7100；Logic 只声明 7002/7100（7000/7001 是占位监听，不暴露）；
+- Logic `terminationGracePeriodSeconds: 1250`（20min 排水 + 50s 余量），preStop 调本机 `POST :7100/admin/drain`；
+- ConfigMap 中 logic 配置 `ws.enabled: false`。
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: gateway
-spec:
-  replicas: 2
-  selector:
-    matchLabels: { app: gateway }
-  template:
-    metadata:
-      labels: { app: gateway }
-    spec:
-      containers:
-      - name: server
-        image: rangame/server:latest
-        args: ["-config", "/etc/server/server.yaml"]
-        ports:
-        - { containerPort: 7000, name: tcp }
-        - { containerPort: 7001, name: ws }
-        - { containerPort: 7100, name: admin }
-        volumeMounts:
-        - { name: config, mountPath: /etc/server }
-      volumes:
-      - name: config
-        configMap: { name: server-config }
-```
-
-Gateway 无状态，可自由水平扩缩。
+本地 Docker 双容器冒烟用 [`deploy/local/`](deploy/local/)（gateway/logic 各一份 compose 配置，通告地址用容器名 `gateway:7002` / `logic:7002`）。
 
 ### 排水缩容（§13.3）
 

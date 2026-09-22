@@ -3,10 +3,14 @@ package bot
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rangame/server/internal/protocol"
+	"github.com/rangame/server/internal/transport"
 )
 
 // ScenarioConfig 压测场景配置。
@@ -86,6 +90,108 @@ func RunRandomLoad(ctx context.Context, cfg ScenarioConfig) Result {
 // 每 5s 随机踢 cfg.ReconnectPct% 连接并重连，观察重放正确性和泄漏。
 func RunReconnect(ctx context.Context, cfg ScenarioConfig) Result {
 	return runScenario(ctx, cfg, "reconnect")
+}
+
+// snake 帧消息 ID（bot 不 import games 包，保持解耦；与 games/snake/messages.go 对齐）。
+const (
+	msgSnakeState  = 0x1001 // 下行 20fps 快照（收到即开局）
+	msgSnakeResult = 0x1002 // 下行结算
+)
+
+// PlayOutcome play 场景对局结果（存档 e2e 验证用）。
+type PlayOutcome struct {
+	UIDs     []string // 参局 bot UID（供 admin /admin/players/{uid} 查存档）
+	Winner   string   // 空=平局
+	Rounds   int64
+	Finihed  bool // 是否正常收到结算（false=超时兜底）
+	Duration time.Duration
+}
+
+// RunPlayMatch 存档链路场景：2 bot 匹配成桌 → 对局（随机转向直至撞墙结算）→
+// 收到 MsgResult 后主动断开（触发宽限→OnRelease 退出强存）。
+// 结算时 OnDestroy Patch 已由 PlayerActor 单写者 SaveSync 落库；
+// 断开后约 grace+sweep 再查档案可验证退出强存不回滚（架构 §10.4.4）。
+func RunPlayMatch(ctx context.Context, cfg ScenarioConfig) PlayOutcome {
+	start := time.Now()
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if cfg.Bots != 2 {
+		cfg.Bots = 2 // 一桌两人
+	}
+
+	ts := time.Now().UnixNano() % 100000
+	out := PlayOutcome{}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i := 0; i < 2; i++ {
+		uid := fmt.Sprintf("play-%d-%d", i, ts)
+		out.UIDs = append(out.UIDs, uid)
+		wg.Add(1)
+		go func(idx int, uid string) {
+			defer wg.Done()
+			b := New(Config{ID: idx, UID: uid, Codec: cfg.Codec, Logger: logger})
+			if err := b.ConnectTo(ctx, cfg.Addr); err != nil {
+				logger.Error("connect", "uid", uid, "err", err)
+				return
+			}
+			defer func() {
+				// 结算后主动断开：触发服务端宽限期 → OnRelease → 退出强存
+				_ = b.Close()
+			}()
+
+			frames := make(chan *transport.Frame, 256)
+			recvCtx, cancelRecv := context.WithCancel(ctx)
+			defer cancelRecv()
+			go func() { _ = b.RecvLoop(recvCtx, func(f *transport.Frame) { frames <- f }) }()
+
+			if err := b.SendMatch(cfg.Module, cfg.Code); err != nil {
+				logger.Error("match", "uid", uid, "err", err)
+				return
+			}
+
+			// 状态机：等开局（首帧快照）→ 周期转向 → 等结算
+			started := false
+			ticker := time.NewTicker(300 * time.Millisecond)
+			defer ticker.Stop()
+			dir := 1
+			for {
+				select {
+				case f := <-frames:
+					switch f.MsgID {
+					case msgSnakeState:
+						started = true
+					case msgSnakeResult:
+						c, _ := protocol.Get(cfg.Codec)
+						var res struct {
+							RoomID string `json:"room_id" protobuf:"bytes,1,opt,name=room_id,proto3"`
+							Winner string `json:"winner" protobuf:"bytes,2,opt,name=winner,proto3"`
+							Rounds int64  `json:"rounds" protobuf:"varint,3,opt,name=rounds,proto3"`
+						}
+						_ = c.Unmarshal(f.Body, &res)
+						mu.Lock()
+						out.Winner, out.Rounds, out.Finihed = res.Winner, res.Rounds, true
+						mu.Unlock()
+						logger.Info("game settled", "uid", uid, "winner", res.Winner, "rounds", res.Rounds)
+						return
+					}
+				case <-ticker.C:
+					if started {
+						// 随机转向（1-4），撞墙结算由服务端判定
+						dir = dir%4 + 1
+						_ = b.SendMove(dir)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(i, uid)
+	}
+	wg.Wait()
+	out.Duration = time.Since(start)
+	return out
 }
 
 func runScenario(ctx context.Context, cfg ScenarioConfig, mode string) Result {

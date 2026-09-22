@@ -159,6 +159,38 @@ func TestDrainController_StateMachine(t *testing.T) {
 	}
 }
 
+// TestWaitDrained_PollWithoutNotify 回归：进排水时房间非零、随后归零但无人
+// Broadcast（notifyRoomChange 未接线）——WaitDrained 必须靠兜底轮询返回，
+// 否则 K8s preStop curl 挂满整个 deadline（演练实测卡死 20m/pod）。
+func TestWaitDrained_PollWithoutNotify(t *testing.T) {
+	var rooms atomic.Int32
+	rooms.Store(1) // 进排水时还有对局
+
+	d := NewDrainController(
+		func() int { return int(rooms.Load()) },
+		nil, // sessionsSrc 为空视为 0
+		func() {},
+		nil, "logic-0",
+	)
+	if err := d.Drain(time.Minute); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	// 200ms 后房间自然结束归零，但不调用 notifyRoomChange（模拟未接线）
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		rooms.Store(0)
+	}()
+
+	start := time.Now()
+	if err := d.WaitDrained(context.Background()); err != nil {
+		t.Fatalf("wait drained: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("WaitDrained took %s: poll fallback not working", elapsed)
+	}
+}
+
 // ---------------- 走查 15：突发防护 ----------------
 
 // TestRedisMatcher_QueueDepth 验证队列深度作为扩容领先信号（§13.8）。

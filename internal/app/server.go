@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/rangame/server/internal/actor"
 	"github.com/rangame/server/internal/admin"
@@ -14,6 +15,7 @@ import (
 	"github.com/rangame/server/internal/room"
 	"github.com/rangame/server/internal/router"
 	"github.com/rangame/server/internal/session"
+	"github.com/rangame/server/internal/storage"
 	"github.com/rangame/server/internal/transport"
 	"github.com/rangame/server/pkg/framework"
 )
@@ -24,13 +26,19 @@ type Server struct {
 	logger  *slog.Logger
 	metrics *obs.Registry
 
-	engine    *actor.Engine
-	storage   framework.Storage
-	sessions  *session.Manager
-	rooms     *room.Manager
-	matcher   *match.Maker
-	router    *router.Router
-	connector *Connector
+	engine       *actor.Engine
+	storage      framework.Storage
+	profileStore framework.ProfileStore // 玩家档案存取（§10.4），可空
+	sessions     *session.Manager
+	rooms        *room.Manager
+	matcher      *match.Maker
+	router       *router.Router
+	connector    *Connector
+
+	// gwConnector 演进态 Gateway 角色的连接处理器；非空时 serveAcceptor 用它替代 connector。
+	gwConnector *GatewayConnector
+	// serveConn 自定义连接处理函数（演进态：Gateway 角色注入 GatewayConnector.ServeConn）。
+	serveConn func(ctx context.Context, conn transport.Conn)
 
 	tcpAcc *transport.TCPAcceptor
 	wsAcc  *transport.WSAcceptor
@@ -87,6 +95,8 @@ func Build(cfg *config.Config, logger *slog.Logger, modules []framework.GameModu
 		}
 		s.storage = st
 	}
+	// 玩家档案存取层（§10.4），复用同一 Storage 后端
+	s.profileStore = storage.NewProfileStore(s.storage)
 
 	s.engine = actor.New(actor.Config{Metrics: s.metrics})
 
@@ -102,6 +112,8 @@ func Build(cfg *config.Config, logger *slog.Logger, modules []framework.GameModu
 
 	s.rooms = room.NewManager(s.engine, s.sessions, s.storage, logger,
 		room.WithDefaultMailbox(framework.MailboxPolicy{Capacity: 4096, OnFull: framework.FullDrop}),
+		// 房间侧 Patch 路由到 PlayerActor 单写者（§10.4.4），避免与退出强存的整档覆盖竞态
+		room.WithProfileStore(s.newPatchRouter()),
 	)
 
 	s.router = router.New(s.engine, router.WithMetrics(s.metrics))
@@ -158,10 +170,12 @@ func Build(cfg *config.Config, logger *slog.Logger, modules []framework.GameModu
 	}
 	s.stdMetrics = obs.RegisterStandard(s.metrics, s.exporter)
 	if s.adminSrv == nil {
+		// 玩家档案离线查询服务（§10.4.3）
+		profileQ := storage.NewProfileQueryService(s.profileStore)
 		s.adminSrv = admin.NewServer(admin.Config{
 			Addr:         cfg.Admin.Addr,
 			TrustedCIDRs: cfg.Admin.TrustedCIDRs,
-		}, logger, s.exporter, nil, nil)
+		}, logger, s.exporter, nil, nil, profileQ)
 	}
 
 	return s, nil
@@ -181,6 +195,14 @@ func (s *Server) Sessions() *session.Manager { return s.sessions }
 func (s *Server) Rooms() *room.Manager       { return s.rooms }
 func (s *Server) Matcher() *match.Maker      { return s.matcher }
 func (s *Server) Store() framework.Storage   { return s.storage }
+
+// AdminAddr 返回 admin HTTP 实际监听地址（未启用返回空串）。
+func (s *Server) AdminAddr() string {
+	if s.adminSrv == nil {
+		return ""
+	}
+	return s.adminSrv.Addr()
+}
 
 // Run 启动扫描与接入循环；ctx 取消后停止接受新连接（停机用 Shutdown 完成排空）。
 func (s *Server) Run(ctx context.Context) {
@@ -206,12 +228,17 @@ func (s *Server) Run(ctx context.Context) {
 func (s *Server) serveAcceptor(ctx context.Context, acc interface {
 	Accept(context.Context) (transport.Conn, error)
 }) {
+	// 演进态 Gateway 角色：用 GatewayConnector 替代单机 Connector。
+	handler := s.serveConn
+	if handler == nil {
+		handler = s.connector.ServeConn
+	}
 	for {
 		conn, err := acc.Accept(ctx)
 		if err != nil {
 			return
 		}
-		go s.connector.ServeConn(ctx, conn)
+		go handler(ctx, conn)
 	}
 }
 
@@ -237,9 +264,16 @@ func (s *Server) onSessionStart(sess *session.Session) {
 	s.playerMu.Lock()
 	defer s.playerMu.Unlock()
 	if _, ok := s.players[uid]; ok {
-		return // 重连：Actor 宽限期内一直存活
+		// 重连：Actor 宽限期内一直存活；仅刷新 session 引用以更新档案快照
+		return
 	}
-	id, err := s.engine.Spawn(&playerActor{uid: uid},
+	pa := &playerActor{
+		uid:          uid,
+		profileStore: s.profileStore,
+		sess:         sess,
+		checkpoint:   s.cfg.Profile.CheckpointInterval.Std(),
+	}
+	id, err := s.engine.Spawn(pa,
 		framework.MailboxPolicy{Capacity: 1024, OnFull: framework.FullKick, DrainBatch: 64}, 0)
 	if err != nil {
 		s.logger.Error("spawn player actor failed", "uid", uid, "err", err)
@@ -327,15 +361,66 @@ func (s *Server) notifyMatchResult(uid string, seq uint32, roomID string, merr e
 	}
 }
 
-// playerActor 玩家个人 Actor：承载个人消息 Handler 闭包串行执行（§7）。
+// playerActor 玩家 Actor：个人消息段的处理者（匹配请求在此入箱）+ 玩家档案生命周期（§10.4）。
 // 生命周期跟随 Session 宽限期（OnRelease 时停止），而非连接。
 type playerActor struct {
-	uid string
+	uid          string
+	profileStore framework.ProfileStore // 可空：未配置存储时禁用档案
+	profile      *framework.PlayerProfile
+	sess         *session.Session // 由 OnSessionStart 注入，用于 SetProfile
+	checkpoint   time.Duration    // 周期 checkpoint 间隔；<=0 禁用
 }
 
-func (a *playerActor) Init(framework.ActorCtx)                           {}
-func (a *playerActor) OnMessage(framework.ActorCtx, *framework.Envelope) {}
-func (a *playerActor) OnStop(framework.ActorCtx)                         {}
+func (a *playerActor) Init(ctx framework.ActorCtx) {
+	if a.profileStore == nil {
+		return
+	}
+	p, err := a.profileStore.Load(context.Background(), a.uid)
+	if err != nil {
+		// Load 失败不阻断登录（§10.4.5 降级：内存态可用，下次登录重试）
+		return
+	}
+	a.profile = p
+	if a.sess != nil {
+		a.sess.SetProfile(p)
+	}
+	// 周期 checkpoint（§10.4.2）；PlayerActor 自驱动，不依赖外部扫描
+	if a.checkpoint > 0 {
+		ctx.Every(a.checkpoint, func() {
+			if a.profile != nil && a.profileStore != nil {
+				_ = a.profileStore.Save(context.Background(), a.uid, a.profile)
+			}
+		})
+	}
+}
+
+func (a *playerActor) OnMessage(_ framework.ActorCtx, env *framework.Envelope) {
+	if msg, ok := env.Payload.(profilePatchMsg); ok {
+		msg.reply <- a.applyPatch(msg.fields)
+	}
+}
+
+// applyPatch 在 PlayerActor goroutine 内应用档案 Patch（单写者，§7.3 红线 1）并立即强存。
+// 结算路径要求落库可靠，走 SaveSync（SyncTimeout 兜底）。
+func (a *playerActor) applyPatch(fields map[string]any) error {
+	if a.profileStore == nil {
+		return nil
+	}
+	if a.profile == nil {
+		// 登录时 Load 失败：内存态缺失，退化为存储层读改写
+		return a.profileStore.Patch(context.Background(), a.uid, fields)
+	}
+	storage.ApplyProfilePatch(a.profile, fields)
+	return a.profileStore.SaveSync(context.Background(), a.uid, a.profile)
+}
+
+func (a *playerActor) OnStop(framework.ActorCtx) {
+	if a.profileStore == nil || a.profile == nil {
+		return
+	}
+	// 退出强存（§10.4.2 OnRelease 路径）；SaveSync 带 SyncTimeout 兜底
+	_ = a.profileStore.SaveSync(context.Background(), a.uid, a.profile)
+}
 
 func wsAddr(a *transport.WSAcceptor) string {
 	if a == nil {
