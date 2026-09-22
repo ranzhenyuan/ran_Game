@@ -18,3 +18,5 @@ coverage.txt
 
 # local wal / data
 /data/
+//忽略tera目录
+.tera/
