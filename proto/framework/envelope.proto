@@ -1,0 +1,29 @@
+// envelope.proto — §4.3 统一错误/响应信封。
+//
+// 所有下行错误与 RPC 式响应使用本信封，客户端 SDK 按同一结构解析。
+// 与 internal/protocol.ErrorEnvelope 的 Go 结构同构：JSON 阶段已用该字段名，
+// 接入 PB Codec 后字段名保持一致。
+//
+// 帧与信封的关系：帧头 msgID 沿用被响应的原请求 msgID，seq 为原请求 seq；
+// Body 为业务 resp 的二次编码（按会话 Codec），无业务数据时为空。
+syntax = "proto3";
+
+package fw;
+
+option go_package = "github.com/rangame/server/proto/framework;fwpb";
+
+// ErrorEnvelope 统一错误/响应信封。err 或 RPC 式响应均用此结构，附原请求 seq。
+message ErrorEnvelope {
+  // seq 原请求 seq，客户端做请求级关联。
+  uint32 seq = 1;
+  // code 0=成功；1xxx 协议/参数；2xxx 会话/鉴权；3xxx 房间/业务；4xxx 服务端。
+  // Go framework.Code 为 uint16，proto3 无 uint16，以 uint32 承载。
+  uint32 code = 2;
+  // msg 文案；空时框架按 code 填默认文案。
+  string msg = 3;
+  // body 可选业务数据（按会话 Codec 二次编码）。
+  bytes body = 4;
+}
+
+// Empty 无业务数据的成功响应占位。
+message Empty {}

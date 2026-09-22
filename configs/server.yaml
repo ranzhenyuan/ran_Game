@@ -1,0 +1,62 @@
+# 单机形态服务器配置（阶段 5：session + room + match + 玩法模块）
+server:
+  role: standalone       # standalone | gateway | logic（后两者为演进态）
+
+tcp:
+  addr: ":7000"
+  read_timeout: 30s     # 读空闲超时，超时关连接（§5.2）
+  write_channel_size: 256
+  write_flush_interval: 2ms
+  max_frame_size: 65536 # 64KB（§3.3）
+  tcp_nodelay: true
+
+ws:                     # WebSocket 接入（§3，浏览器/H5 走此端口）
+  enabled: true
+  addr: ":7001"
+  path: "/ws"
+  allowed_origins:      # 空=仅同源；可填完整 Origin 或裸 Host；"*" 仅限测试/内网
+    - "https://game.example.com"
+  read_timeout: 30s
+  write_channel_size: 256
+  max_frame_size: 65536
+
+session:                # 会话生命周期与断线重连（§5）
+  grace_period: 60s     # 断线后会话/PlayerActor 保留宽限期，超时释放
+  replay_buffer: 256    # 可靠通道环形缓冲容量（帧）；溢出通知客户端 Resync
+  heartbeat_ms: 15000   # 登录响应下发的应用层心跳间隔
+  max_login_body: 4096  # 登录/重连包体上限（§11.4）
+  sweep_interval: 5s    # 宽限期后台扫描间隔
+
+storage:                # 持久化（§10）；memory 零外部依赖，redis/mysql 带异步写回+WAL+熔断
+  driver: memory        # memory | redis | mysql
+  # redis_addr: "127.0.0.1:6379"
+  # redis_db: 0
+  # mysql_dsn: "game:pass@tcp(127.0.0.1:3306)/game?parseTime=true"
+  writeback_queue: 4096  # 异步写回有界队列；溢出 → WAL
+  flush_interval: 10ms   # 后台批量 flush 间隔（Actor 路径永不同步等 IO）
+  flush_batch: 256
+  flush_retry: 2         # flush 失败重试次数，仍失败转 WAL
+  wal_path: "./data/wal" # 二级降级：队列溢出/flush 失败落盘，恢复后自动重放；留空禁用
+  breaker_cooldown: 5s   # 熔断后多久进入半开探测；探测成功自动恢复
+  sync_timeout: 2s       # Get/SetSync/IncrBy 同步路径超时
+
+cluster:                # 集群演进态配置（§12/§13，仅 role=gateway|logic 时使用）
+  # node_id: "logic-snake-0"  # StatefulSet：logic-{module}-{ordinal}；Deployment 留空自动生成
+  # modules:                    # 本节点服务的玩法 module 列表（logic 必填）
+  #   - snake
+  drain_deadline: 20m   # 排水截止时间（§13.3，HPA terminationGracePeriodSeconds 需 ≥ 此值）
+  # redis_addr: "127.0.0.1:6379"  # 注册表 Redis；空=用进程内 MemRegistry（演进态骨架）
+  # redis_db: 0
+  node_ttl: 15s         # 节点条目 TTL（§13.2）；心跳每 5s 刷新
+
+admin:                 # 运维面 HTTP server（§11，必须内网，§11.4）
+  addr: 127.0.0.1:7100 # 监听地址；K8s 部署用 0.0.0.0:7100 + NetworkPolicy 限制
+  # trusted_cidrs:       # 信任的来源 IP CIDR；空表示仅 127.0.0.1
+  #   - 10.0.0.0/8
+
+log:
+  level: info           # debug | info | warn | error
+
+pprof:
+  enabled: true
+  addr: "127.0.0.1:6060"

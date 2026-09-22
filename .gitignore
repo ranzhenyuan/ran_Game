@@ -1,0 +1,20 @@
+# binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# test / coverage
+*.test
+*.out
+coverage.txt
+
+# workspace
+.idea/
+.vscode/
+*.log
+
+# local wal / data
+/data/

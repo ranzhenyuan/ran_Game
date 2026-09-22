@@ -1,0 +1,23 @@
+// snapshot.proto — 快照通道拉取（§5.3 latest-wins）。
+//
+// PullSnapshotReq 与 internal/session/messages.go 的 PullSnapshotReq 同构。
+// 重连后按 msgID 拉取快照通道最新值；msgIDs 为空表示拉全部。
+syntax = "proto3";
+
+package fw;
+
+option go_package = "github.com/rangame/server/proto/framework;fwpb";
+
+// MsgPullSnap=0x0140。
+message PullSnapshotReq {
+  repeated uint32 msgids = 1;
+}
+
+message SnapshotItem {
+  uint32 msgid = 1;
+  bytes  body  = 2;
+}
+
+message PullSnapshotResp {
+  repeated SnapshotItem items = 1;
+}

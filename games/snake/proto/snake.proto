@@ -1,0 +1,53 @@
+// snake.proto — 贪吃蛇玩法消息（架构文档 §14/§16.4 走查示例）。
+//
+// 与 games/snake/messages.go 的 Go 结构同构，字段名按当前 Go 定义。
+// msgID 段：snake 为第 0 个业务模块（0x1000 起，每模块 256 个）：
+//   MsgMove   = 0x1000  上行转向（可靠通道，ToRoom）
+//   MsgState  = 0x1001  下行局面快照（快照通道，latest-wins）
+//   MsgResult = 0x1002  下行结算（可靠通道）
+// 成员变更复用框架 MsgMemberChange=0x0112，信体即 MemberNtf。
+syntax = "proto3";
+
+package snake;
+
+option go_package = "github.com/rangame/server/games/snake/proto;snakepb";
+
+// Point 格点（网格坐标）。
+message Point {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+// MoveReq 转向请求。MsgMove=0x1000。
+// dir 取值：1=上 2=下 3=左 4=右（与 games/snake Dir* 常量一致）。
+message MoveReq {
+  int32 dir = 1;
+}
+
+// SnakeState 单条蛇的局面子集。Body[0] 为蛇头。
+message SnakeState {
+  string uid          = 1;
+  repeated Point body = 2;
+  bool alive          = 3;
+  int32 score         = 4;
+}
+
+// StateNtf 全量局面快照。MsgState=0x1001（快照通道，20fps latest-wins）。
+message StateNtf {
+  int64 tick                 = 1;
+  repeated SnakeState snakes = 2;
+  Point food                  = 3;
+}
+
+// ResultNtf 结算。MsgResult=0x1002（可靠通道），同时落库 snake_result 表。
+message ResultNtf {
+  string room_id = 1;
+  string winner  = 2; // 空=平局
+  int64 rounds   = 3;
+}
+
+// MemberNtf 成员变更提示（复用框架 MsgMemberChange=0x0112）。
+message MemberNtf {
+  string uid   = 1;
+  string event = 2; // "join" | "leave"
+}

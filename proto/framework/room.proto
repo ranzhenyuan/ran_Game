@@ -1,0 +1,57 @@
+// room.proto — 房间/匹配通用消息、对局找回与全量同步。
+//
+// 匹配三消息（MatchReq/MatchCancelReq/MatchResp）与 internal/match/messages.go
+// 的 Go 结构（Request/CancelRequest/Response）同构，字段名按当前 Go 定义。
+// 其余房间级消息（进退房、成员变更、找回、Resync）为框架通用契约，对应
+// pkg/framework/msgid.go 的 0x0100–0x0131 段。
+syntax = "proto3";
+
+package fw;
+
+option go_package = "github.com/rangame/server/proto/framework;fwpb";
+
+// §8.2 / §13.5 匹配。MsgMatch=0x0100。
+// module 由登录态/路由决定；code 为玩法内规则码。
+message MatchReq {
+  string module = 1;
+  string code   = 2;
+}
+// MsgMatchCancel=0x0101。无业务字段。
+message MatchCancelReq {}
+// 匹配成桌通知（服务端主动下发，复用原请求 seq）。对应 match.Response。
+message MatchResp {
+  string room_id = 1;
+}
+
+// §8 进/退房（框架通用，玩法状态走各自消息）。
+// MsgJoinRoom=0x0110 / MsgLeaveRoom=0x0111。
+message JoinRoomReq {
+  string room_id = 1;
+}
+message LeaveRoomReq {
+  string room_id = 1;
+}
+
+// §8 成员变更通知。MsgMemberChange=0x0112。
+// 字段对齐当前广播契约（internal/room 测试与 games/snake.MemberNtf 均用 uid+event）。
+message RoomMemberChanged {
+  string uid   = 1;
+  string event = 2; // "join" | "leave"
+}
+
+// §5.1 宽限期外的对局找回。MsgRecoverRoom=0x0120。
+message RecoverableRoom {
+  string room_id = 1;
+  string module  = 2;
+  uint32 ttl_ms  = 3; // recover:room:{uid} 剩余 TTL
+}
+
+// §5.3 可靠重放溢出时由服务端触发全量同步。
+// MsgResyncReq=0x0130 / MsgResyncNtf=0x0131。
+message ResyncReq {
+  string room_id = 1;
+}
+message ResyncNtf {
+  string room_id = 1;
+  bytes  snapshot = 2; // 内容由玩法定义
+}

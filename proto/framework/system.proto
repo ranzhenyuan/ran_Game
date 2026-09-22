@@ -1,0 +1,63 @@
+// system.proto — 系统握手、心跳、登录/重连与服务端主动通知。
+//
+// 与 internal/session/messages.go 的 Go 结构同构（LoginReq/Resp、ReconnectReq/Resp、
+// Ping/Pong）。重放差额帧不在 ReconnectResp 内编码，握手成功后由服务端按原始帧
+// 原样顺序推送（客户端按普通帧消费、按 seq 去重）——故不设 FrameLog 字段。
+syntax = "proto3";
+
+package fw;
+
+option go_package = "github.com/rangame/server/proto/framework;fwpb";
+
+// §5.2 心跳：由读泵直接应答，不进 Actor 邮箱。
+// MsgPing=0x0001 / MsgPong=0x0002。
+message Ping {
+  int64 client_ts = 1;
+}
+message Pong {
+  int64 client_ts = 1;
+  int64 server_ts = 2;
+}
+
+// §5 登录。MsgLogin=0x0010。
+message LoginReq {
+  string uid          = 1; // 业务 UID
+  string token        = 2; // 业务鉴权 token（自有账号/三方）
+  uint32 protocol_ver = 3; // §4.1 ver 协商
+  uint32 codec        = 4; // 0=JSON 1=PB
+  string platform     = 5; // h5 / wx / app ...
+}
+message LoginResp {
+  string reconnect_token = 1; // §11.4 一次性消费
+  uint32 heartbeat_ms    = 2; // 服务端下发心跳间隔（默认 15000）
+  string session_id      = 3;
+}
+
+// §5 重连。MsgReconnect=0x0011。
+message ReconnectReq {
+  string reconnect_token  = 1;
+  uint32 last_reliable_seq = 2; // §5.3 可靠通道最后收到的 seq
+}
+message ReconnectResp {
+  string new_reconnect_token = 1; // 旧 token 即作废
+  bool resync_required       = 2; // 可靠缓冲已溢出：忽略后续重放帧并主动发 ResyncReq
+}
+
+// §11.4 / §6.1 踢人通知。MsgKick=0x0020。
+// 对应 internal/room 在 Kick 时下发的 {code,reason} 信体。
+message KickNotice {
+  uint32 code   = 1; // 2004 被踢
+  string reason = 2;
+}
+
+// §12.5 / §13.3 停机/Logic 排水/滚动发版。MsgMaintenance=0x0021（错误码 4005）。
+message MaintenanceNotice {
+  uint32 code           = 1;
+  string reason         = 2;
+  uint32 retry_after_ms = 3; // 客户端静默重连提示（指数退避由 SDK 执行）
+}
+
+// §12.4 Logic 宕机通知。MsgLogicDown=0x0022。
+message LogicDownNotice {
+  string trace = 1;
+}
