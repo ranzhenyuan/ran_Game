@@ -133,9 +133,3 @@ cluster:
 - [PROTOCOL.md](PROTOCOL.md) — 接入层协议规格
 - [EXTENDING.md](EXTENDING.md) — 新玩法模块接入指南
 - [DEPLOY.md](DEPLOY.md) — 部署手册
-
-## 约束
-
-- 依赖方向：`games → pkg/framework`，`internal` 不允许 import `games`
-- 阶段 1-9 不实现真实多进程集群（架构文档 §49 约束），演进态骨架在单进程内验证设计可行
-- 不主动创建文档；本次文档为用户明确请求
