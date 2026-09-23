@@ -81,6 +81,15 @@ type ClusterConfig struct {
 	// 空=用 InternalAddr；K8s 用 "${POD_IP}:7002" 注入（fieldRef status.podIP），
 	// 因为监听地址 :7002 是通配形式，不能作为其他节点的拨号目标。
 	InternalAdvertiseAddr string `yaml:"internal_advertise_addr"`
+	// RouteTTL 一级路由表条目 TTL（RedisRouteTable，§12.4）。
+	// 仅防 Logic 崩溃未 Unbind 的僵尸映射；正常生命周期走显式 Bind/Unbind/Invalidate。
+	RouteTTL Duration `yaml:"route_ttl"`
+	// KeepaliveInterval 内部链路应用层 idle 心跳周期（§12.3，默认 30s）。
+	// 超过该间隔无业务写出则发一帧链路心跳，防止 LB/NAT idle 回收；<=0 用默认。
+	KeepaliveInterval Duration `yaml:"keepalive_interval"`
+	// ReconnCheck 内部链路后台探活/重连扫描周期（§12.3，默认 2s）。
+	// 周期扫描活跃对端，连接死亡则自动重拨；<=0 用默认。
+	ReconnCheck Duration `yaml:"reconn_check"`
 }
 
 type TCPConfig struct {
@@ -189,8 +198,11 @@ func Default() Config {
 			SyncTimeout:     Duration(2 * time.Second),
 		},
 		Cluster: ClusterConfig{
-			DrainDeadline: Duration(20 * time.Minute),
-			NodeTTL:       Duration(15 * time.Second),
+			DrainDeadline:     Duration(20 * time.Minute),
+			NodeTTL:           Duration(15 * time.Second),
+			RouteTTL:          Duration(24 * time.Hour),
+			KeepaliveInterval: Duration(30 * time.Second),
+			ReconnCheck:       Duration(2 * time.Second),
 		},
 		Profile: ProfileConfig{
 			CheckpointInterval: Duration(60 * time.Second),
@@ -298,6 +310,17 @@ func (c *Config) Validate() error {
 		}
 		if c.Cluster.InternalAdvertiseAddr != "" && c.Cluster.InternalAddr == "" {
 			return fmt.Errorf("cluster.internal_addr is required when internal_advertise_addr is set")
+		}
+		if c.Cluster.RedisAddr != "" && c.Cluster.RouteTTL.Std() <= 0 {
+			return fmt.Errorf("cluster.route_ttl must be positive when redis_addr is set")
+		}
+		if c.Cluster.InternalAddr != "" {
+			if c.Cluster.KeepaliveInterval.Std() <= 0 {
+				return fmt.Errorf("cluster.keepalive_interval must be positive")
+			}
+			if c.Cluster.ReconnCheck.Std() <= 0 {
+				return fmt.Errorf("cluster.reconn_check must be positive")
+			}
 		}
 	}
 	return nil

@@ -60,7 +60,7 @@ go run ./cmd/benchbot -scenario all -bots 100 -duration 30s -addr ws://127.0.0.1
 
 ## 演进态集群（gateway + logic）
 
-Gateway/Logic 拆分已落地：真实跨节点链路（TCPNodeTransport）已接线并经双节点端到端测试，`deploy/k8s/` 提供可直接 apply 的完整清单。当前限制：一级路由表为进程内实现（多 Gateway 副本下的共享路由表为下一阶段交付），生产多副本部署前关注此前提。
+Gateway/Logic 拆分已落地：真实跨节点链路（TCPNodeTransport）已接线并经双节点端到端测试，`deploy/k8s/` 提供可直接 apply 的完整清单。一级路由表已支持 Redis 共享实现（`RedisRouteTable`）：配置 `cluster.redis_addr` 后，多 Gateway 副本经同一 Redis 共享 uid→logicNode 映射，已通过双副本端到端验证（gw-a 登录、gw-b 查得并转发）。
 
 ### 角色分派
 

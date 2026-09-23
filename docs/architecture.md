@@ -695,8 +695,8 @@ flowchart LR
 > | 能力 | 状态 | 实现落点 |
 > |------|------|---------|
 > | 角色分派装配（gateway/logic） | ✅ | `app.BuildGateway` / `app.BuildLogic`（`server.role`） |
-> | 一级路由表（进程内） | ✅ 骨架 | `gateway.MemRouteTable`（uid→nodeID，watch 注册表失效） |
-> | 一级路由表（Redis 共享） | ⏳ 下一阶段 | 多 Gateway 副本前提；当前双副本需待 RedisRouteTable |
+> | 一级路由表（进程内） | ✅ | `gateway.MemRouteTable`（uid→nodeID，watch 注册表失效；单副本/测试用） |
+> | 一级路由表（Redis 共享） | ✅ | `gateway.RedisRouteTable`：`cluster:route:{uid}` + 反向集，Lua 原子 Bind/条件 Unbind，3s 本地缓存，Down→Invalidate；`cluster.redis_addr` 非空启用 |
 > | 内部 Transport（进程内） | ✅ | `MemNodeTransport`（同进程骨架直达） |
 > | 内部 Transport（真实 TCP） | ✅ | `TCPNodeTransport`，`cluster.internal_addr` 非空启用 |
 > | Gateway 侧收发 | ✅ | `app.GatewayConnector`：登录选节点/业务帧转发/下行回写/心跳直回 |
@@ -763,6 +763,9 @@ flowchart LR
 | 线格式 | `[4B 大端 payloadLen][innerHeader 文本前缀 "uid\|sessID\|gwID\|msgType\|seq\n"][§4.1 原始帧]`；多 envelope 可在同一 TCP 段聚合，接收方按长度前缀切流 |
 | 写聚合 | 与客户端连接同机制：首帧触发 2ms 攒批窗口 / 4KB 上限；出站写失败自动清连接重拨一次 |
 | 断连检测 | 每连接一个只读协程消费数据：TCP 半关闭下写可能先进内核缓冲，读 EOF 是唯一可靠关闭信号，检测到即标记连接死亡 |
+| 保活心跳 | ① 内核 `SO_KEEPALIVE`（30s 周期）探测半开死链；② 应用层 idle 心跳：出站连接每 30s 无业务写出则发一帧 `MsgKeepalive`（`lastWrite` 节流，有流量时不发），防止 LB/NAT 因 idle 回收连接，接收方直接丢弃不进业务 |
+| 自动重连 | 后台 `reconnectLoop` 每 2s 扫描曾建立过连接的对端（`activePeers`）：连接缺失或已死则重拨，拨号失败退避 1s 后再试；断连恢复不依赖下一次业务 `Forward`，降低首帧延迟与丢帧率 |
+| 连接预热/注册表联动 | `Warmup` 预拨号建长连接；app 装配层 `wireTransportWarmup` 订阅注册表：对端节点 `Active` 事件即预热（消除首帧拨号延迟），`Down/Draining` 即 `RemovePeer` 清连接并停止后台重连。先同步订阅再扫描，杜绝事件丢失窗口。Gateway/Logic 双向对称接入（互以对方角色为对端） |
 | 寻址 | 节点不预拨号簿：目标地址查 NodeRegistry 注册条目的 `Addr`（即 `internal_advertise_addr`，K8s 注入 `${POD_IP}:7002`）；监听地址 `:7002` 是通配形式，不能作为拨号目标 |
 | 入站分发 | 入站帧按发送方 nodeID（转发时加盖的来源 ID）查具名 handler；对端副本动态扩缩无法预注册，故另有"默认 handler"兜底——GatewayConnector 与 LogicHandler 均注册为各自节点的默认入口 |
 
@@ -776,7 +779,7 @@ flowchart LR
 ### 12.4 会话路由与粘性
 
 - **路由表**：`{module}:uid → LogicNode` 存 Redis + Gateway 本地缓存；登录/重连时由 Logic 写入。分配策略见 §13.6（粘性不迁移 + 新房按最少活跃房间加权），取代简单一致性哈希——弹性场景节点增减不搬迁存量会话；
-  - **当前实现**：`MemRouteTable` 为进程内映射（演进骨架），登录成功后由 **GatewayConnector** 写入本地表；Logic 侧尚不需要写（同进程/单网关副本下路由表就在 Gateway 本地）。升级为多 Gateway 副本时按本节契约改为 Redis 共享表、写入主体迁回 Logic（会话建立的唯一知情方），Gateway 退为只读 + 短 TTL 本地缓存；
+  - **当前实现**：`cluster.redis_addr` 非空时启用 `RedisRouteTable`（共享表）—— 登录/重连成功后由 **LogicHandler** 写入 `cluster:route:{uid}`（Lua 原子，含反向集 `cluster:route:node:{nodeID}` 供失效），Gateway 只读 + 3s 本地缓存；进程内 `MemRouteTable` 保留为单副本/测试回退。写入主体在 Logic（会话建立的唯一知情方），顶踢/快速重连靠条件 `Unbind(uid, nodeID)` 防止旧会话释放误删新映射；节点 Down 经注册表事件触发 `Invalidate(nodeID)` 批量清键；
   - 骨架阶段 Gateway 登录时需解析登录请求体取 uid 以建立下行连接索引，属"哑管道"原则的**唯一例外**（仅登录帧、仅取 uid 字段，不触碰玩法 body）；
 - **按玩法分区**：路由键带 module 维度，snake/card 等玩法可落到独立 Logic 集群、独立 HPA（§13.6）；
 - **同房同节点**：房间类玩法要求同房成员在同一 Logic 进程——`RoomManager` 分配 roomID 时写 `roomID → node`，Gateway 对房间消息按 roomID 路由；跨节点组房由 MatchMaker 在分配时完成成员落点（不让房间运行中迁移）；
@@ -865,6 +868,8 @@ cluster:nodes:change  Pub/Sub 频道（拓扑/状态变更主动通知，见 §1
 > 设计稿原为 `cluster:nodes:{role}` 单 Hash + 按 field TTL；实现简化为每节点独立 key（Hash 不支持单 field TTL，独立 key 崩溃节点可自动过期）。
 >
 > 注册条目中的 `addr` 在拆分部署下是**内部链路通告地址**（`cluster.internal_advertise_addr`，K8s 为 `${POD_IP}:7002`），即其他节点 TCPNodeTransport 的懒拨号目标；不能填监听用的通配地址 `:7002`。
+>
+> **Logic↔Redis 长连接**：go-redis 默认 dialer 已带 `KeepAlive`（5min）与连接池复用，不另配连接池（项目规则）。保障手段：① 启动期 `Ping` 连通性预检，Redis 不可达快速失败；② 心跳循环（每 5s）单次失败仅记日志 + 计数、不退出，由连接池自愈重连后下一拍恢复续期，避免 Redis 抖动导致节点被误标 Down 级联；③ `OnConnect` 钩子统计 `redis_connect_total`（含断连重连），心跳失败计数 `registry_heartbeat_fail_total`，作为链路健康度指标。
 
 - Logic 启动 → 内部链路监听就绪 → 注册为 `Active`；Gateway 启动注册后从注册表发现 Logic 列表。
 - K8s 环境下**注册数据可由 Endpoints + Pod 标签/annotation 替代**（state 写 annotation/condition），二选一，接口一致。

@@ -89,7 +89,8 @@ func (c *GatewayConnector) ServeConn(ctx context.Context, conn transport.Conn) {
 	}
 }
 
-// handleLogin 登录转发：选 Logic 节点 → 转发 → 等响应 → 写客户端 → Bind 路由。
+// handleLogin 登录转发：选 Logic 节点 → 转发 → 等响应 → 写客户端。
+// 一级路由由 Logic 在会话建成后写入（§12.4），Gateway 只读不写。
 func (c *GatewayConnector) handleLogin(_ context.Context, gc *gwConn, f *transport.Frame) error {
 	// 先解析 uid 并注册到本地连接表，确保下行响应能找到本连接
 	// （响应在 request 阻塞期间到达，须提前绑定）。
@@ -116,7 +117,6 @@ func (c *GatewayConnector) handleLogin(_ context.Context, gc *gwConn, f *transpo
 	}
 
 	gc.logicNode = nodeID
-	_ = c.gw.Routes().Bind(uid, nodeID)
 	return nil
 }
 

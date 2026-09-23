@@ -30,6 +30,7 @@ import (
 	"github.com/rangame/server/internal/app"
 	"github.com/rangame/server/internal/cluster"
 	"github.com/rangame/server/internal/config"
+	"github.com/rangame/server/internal/gateway"
 	"github.com/rangame/server/internal/obs"
 	"github.com/rangame/server/pkg/framework"
 )
@@ -62,16 +63,24 @@ func main() {
 	var srv *app.Server
 	var logicExtra *app.LogicExtra
 	var registry cluster.NodeRegistry
+	var rdb *redis.Client
 	switch cfg.Server.Role {
 	case "standalone", "":
 		srv, err = app.Build(cfg, logger, modules, app.WithMetrics(metrics))
 	case "gateway", "logic":
-		registry, err = buildRegistry(cfg, logger)
+		registry, rdb, err = buildRegistry(cfg, logger, metrics)
 		if err != nil {
 			logger.Error("registry build failed", "err", err)
 			os.Exit(1)
 		}
 		defer registry.Close()
+		// Redis 可用时用共享路由表（多 Gateway 副本前提）；空则进程内 Mem。
+		// client 与 RedisRegistry 共用同一连接，不另起连接池。
+		var routes gateway.RouteTable
+		if rdb != nil {
+			routes = gateway.NewRedisRouteTable(rdb, registry, cfg.Cluster.RouteTTL.Std())
+			defer routes.Close()
+		}
 		cc := app.ClusterConfig{
 			NodeID:                cfg.Cluster.NodeID,
 			Modules:               cfg.Cluster.Modules,
@@ -79,6 +88,9 @@ func main() {
 			Registry:              registry,
 			InternalAddr:          cfg.Cluster.InternalAddr,
 			InternalAdvertiseAddr: cfg.Cluster.InternalAdvertiseAddr,
+			Routes:                routes,
+			KeepaliveInterval:     cfg.Cluster.KeepaliveInterval.Std(),
+			ReconnCheck:           cfg.Cluster.ReconnCheck.Std(),
 		}
 		if cfg.Server.Role == "gateway" {
 			role := cluster.RoleGateway
@@ -131,21 +143,41 @@ func main() {
 	logger.Info("server stopped")
 }
 
-// buildRegistry 按 cluster 配置创建 NodeRegistry。
+// buildRegistry 按 cluster 配置创建 NodeRegistry，同时返回共享的 redis client（供路由表复用）。
 //
-//	redis_addr 为空 → 进程内 MemRegistry（演进态骨架，单进程集成测试用）；
-//	非空 → RedisRegistry（真实分布式部署，需 Redis 实例）。
-func buildRegistry(cfg *config.Config, logger *slog.Logger) (cluster.NodeRegistry, error) {
+//	redis_addr 为空 → 进程内 MemRegistry（演进态骨架，单进程集成测试用），client 返回 nil；
+//	非空 → RedisRegistry + 同一 client（不另起连接池）。
+func buildRegistry(cfg *config.Config, logger *slog.Logger, metrics *obs.Registry) (cluster.NodeRegistry, *redis.Client, error) {
 	if cfg.Cluster.RedisAddr == "" {
 		logger.Info("using in-memory node registry (evolutionary stub)")
-		return cluster.NewMemRegistry(), nil
+		return cluster.NewMemRegistry(), nil, nil
 	}
-	rdb := redis.NewClient(&redis.Options{
+	// OnConnect 是连接建立回调（非连接池配置，不违反“不新加连接池配置”规则）：
+	// 每次底层连接新建（含断连重连）计数，作为 Redis 链路健康度指标。
+	opts := &redis.Options{
 		Addr: cfg.Cluster.RedisAddr,
 		DB:   cfg.Cluster.RedisDB,
-	})
-	return cluster.NewRedisRegistry(rdb, cluster.Config{
+	}
+	if metrics != nil {
+		connectCnt := metrics.Counter("redis_connect_total")
+		opts.OnConnect = func(_ context.Context, _ *redis.Conn) error {
+			connectCnt.Inc()
+			return nil
+		}
+	}
+	rdb := redis.NewClient(opts)
+	// 启动连通性预检：Redis 不可达时快速失败，而非运行时心跳/路由才暴露。
+	// 不改连接池配置（项目规则）；go-redis 默认 dialer 已带 KeepAlive，连接由池复用。
+	pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		cancel()
+		_ = rdb.Close()
+		return nil, nil, fmt.Errorf("redis registry ping %q: %w", cfg.Cluster.RedisAddr, err)
+	}
+	cancel()
+	reg := cluster.NewRedisRegistry(rdb, cluster.Config{
 		NodeTTL: cfg.Cluster.NodeTTL.Std(),
 		Channel: "cluster:nodes:change",
-	}), nil
+	})
+	return reg, rdb, nil
 }

@@ -76,6 +76,7 @@ rangGame/
 │   │   └── match_redis.go             # §13.5 Lua 原子组队
 │   ├── gateway/                       # 【演进态】Gateway 装配：一级路由 + 内部 Transport
 │   │   ├── gateway.go                 # §12.4 Gateway + MemRouteTable（watch 注册表失效）
+│   │   ├── route_redis.go             # §12.4 RedisRouteTable（共享路由表，Lua 原子 Bind/Unbind + 反向集失效）
 │   │   └── node_transport.go          # §12.3 NodeTransport 接口 + Mem/TCP 两实现（懒拨号/写聚合）
 │   └── obs/                           # logger / metrics / pprof / trace
 ├── pkg/
@@ -126,7 +127,7 @@ app 内 GatewayConnector / LogicHandler 是拆分两侧的收发实现，session
 | `internal/timer` | 最小堆定时器、回调 Tell 回 Actor 邮箱、Actor 级定时器表随销毁取消、可注入 Clock、Module Cron runner | Scheduler、Clock、Cron | 全局 1 个调度 goroutine；回调不直接执行 | §9/§15.4 |
 | `internal/storage` | KV/Ranking 接口、异步写回队列、失败重试、本地 WAL 兜底、按 table 熔断与半开探测、redis/mysql 适配 | Storage、Ranking、WriteBack、Breaker | 后台 flush worker 池；Actor 调用零阻塞 | §10 |
 | `internal/cluster` | **演进态**：节点注册表（每节点独立 key `cluster:node:{id}` + TTL + Pub/Sub）、Active/Draining/Drained 状态机、preStop drain API、Redis Lua 分布式匹配 | NodeRegistry、DrainController、RedisMatcher | 控制面；心跳 5s | §13 |
-| `internal/gateway` | **演进态（已装配）**：Gateway 装配、一级路由表（Mem 已落地/Redis 待演进）与注册表事件失效、内部 node-to-node Transport（进程内 Mem + 真实 TCP 懒拨号/写聚合/默认入站 handler） | Gateway、MemRouteTable、MemNodeTransport、TCPNodeTransport | Gateway 无状态水平扩；7002 仅集群内 | §12/§13 |
+| `internal/gateway` | **演进态（已装配）**：Gateway 装配、一级路由表（Mem 单副本/Redis 共享两实现均已落地，注册表 Down 事件触发 Invalidate）、内部 node-to-node Transport（进程内 Mem + 真实 TCP 懒拨号/写聚合/默认入站 handler） | Gateway、MemRouteTable、RedisRouteTable、MemNodeTransport、TCPNodeTransport | Gateway 无状态水平扩；7002 仅集群内 | §12/§13 |
 | `internal/obs` | slog 结构化日志、Prometheus 指标、pprof 端点、traceID 生成与透传 | Logger、Metrics、Tracer | 横切，无业务状态 | §11.1/§11.2 |
 | `pkg/framework` | 业务唯一可依赖面：Module/Actor/RoomLogic 接口、Route 选项、错误码、系统 msgID、App 构造器 | 稳定 API 包 | 接口定义，无实现 | §14 |
 | `games/snake` | 示例：proto + SnakeGame(实现 RoomLogic/TimeoutLogic) + SnakeModule(注册) | 业务代码 | 仅在 Actor goroutine 内执行 | §14 |
@@ -799,6 +800,6 @@ const (
 | 5 | storage（接口+内存 fake）、room、match（simple） | 单机跑通贪吃蛇（§16.4 走查 1–11） |
 | 6 | storage redis/mysql + 写回/WAL/熔断 | 故障注入：依赖挂掉降级路径 |
 | 7 | protobuf Codec、bench/bot | §15.1 四场景压测达 §15.2 目标 |
-| 8（演进，已落地） | cluster、gateway、RedisMatcher + app 装配（GatewayConnector/LogicHandler/RemoteConn） | 角色分派可运行；真实 TCP 双节点端到端通过；K8s 清单可部署；Redis 共享路由表/LogicDown 通知为后续阶段 |
+| 8（演进，已落地） | cluster、gateway、RedisMatcher + app 装配（GatewayConnector/LogicHandler/RemoteConn）、RedisRouteTable 共享路由表 | 角色分派可运行；真实 TCP 双节点端到端通过；双 Gateway 副本经共享 Redis 路由端到端通过；K8s 清单可部署；LogicDown 主动通知为后续阶段 |
 
 **实现纪律**：单机形态（阶段 1–7）不 import `internal/cluster`、`internal/gateway`——业务代码零演进代码；演进能力只在 `server.role=gateway|logic` 时经 `app.BuildGateway/BuildLogic` 装配启用，games/* 仍只依赖 pkg/framework。

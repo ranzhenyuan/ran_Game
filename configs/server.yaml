@@ -53,6 +53,13 @@ cluster:                # 集群演进态配置（§12/§13，仅 role=gateway|l
   # internal_addr: ":7002"
   # 注册到注册表的对端拨号地址，必须对端可达（不能用通配的 :7002）；K8s 注入 "${POD_IP}:7002"
   # internal_advertise_addr: "127.0.0.1:7002"
+  # 一级路由表（§12.4）：redis_addr 非空时启用 Redis 共享表；route_ttl 为路由条目
+  # 防崩溃僵尸的兜底 TTL（正常生命周期走显式 Bind/Unbind/Invalidate，不续租）。留空=24h。
+  # route_ttl: 24h
+  # 内部链路长连接（§12.3）：keepalive_interval=应用层 idle 心跳周期（防 LB/NAT idle 回收）；
+  # reconn_check=后台探活/重连扫描周期。均仅 internal_addr 非空时生效，留空=30s / 2s。
+  # keepalive_interval: 30s
+  # reconn_check: 2s
 
 admin:                 # 运维面 HTTP server（§11，必须内网，§11.4）
   addr: 127.0.0.1:7100 # 监听地址；K8s 部署用 0.0.0.0:7100 + NetworkPolicy 限制

@@ -22,6 +22,7 @@ type LogicHandler struct {
 	sessions  *session.Manager
 	router    *router.Router
 	transport gateway.NodeTransport
+	routes    gateway.RouteTable // 一级路由表（由 Logic 写入/清除）
 	nodeID    string
 	logger    *slog.Logger
 
@@ -33,6 +34,7 @@ func NewLogicHandler(
 	sessions *session.Manager,
 	r *router.Router,
 	tr gateway.NodeTransport,
+	routes gateway.RouteTable,
 	nodeID string,
 	logger *slog.Logger,
 ) *LogicHandler {
@@ -40,6 +42,7 @@ func NewLogicHandler(
 		sessions:  sessions,
 		router:    r,
 		transport: tr,
+		routes:    routes,
 		nodeID:    nodeID,
 		logger:    logger,
 	}
@@ -108,6 +111,13 @@ func (h *LogicHandler) handleLogin(inner gateway.InnerHeader, f *transport.Frame
 	rc := session.NewRemoteConn(req.UID, inner.GatewayID, h.sendFunc(inner))
 	sess, token := h.sessions.Create(req.UID, rc, codec.Type())
 
+	// 写一级路由 uid→本节点（必须在 Create 之后：顶踢时 Create 会先触发旧会话
+	// OnRelease→Unbind，再由本 Bind 写入新节点，顺序保证不被覆盖）。
+	if err := h.routes.Bind(req.UID, h.nodeID); err != nil {
+		h.sendError(inner, f, framework.NewErr(framework.ErrInternal, "route bind failed"))
+		return
+	}
+
 	// token 加 nodeID 前缀，Gateway 重连时据此路由回本节点。
 	prefixedToken := h.nodeID + ":" + token
 	resp := session.LoginResp{
@@ -145,6 +155,12 @@ func (h *LogicHandler) handleReconnect(inner gateway.InnerHeader, f *transport.F
 	sess, err := h.sessions.Reconnect(rawToken, rc, codec.Type())
 	if err != nil {
 		h.sendError(inner, f, framework.NewErr(framework.ErrTokenInvalid, ""))
+		return
+	}
+
+	// 重连成功后刷路由（跨节点重连时迁移 uid 到新节点，Lua 自动处理反向集）。
+	if err := h.routes.Bind(sess.UID(), h.nodeID); err != nil {
+		h.sendError(inner, f, framework.NewErr(framework.ErrInternal, "route bind failed"))
 		return
 	}
 

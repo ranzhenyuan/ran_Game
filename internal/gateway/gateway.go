@@ -33,9 +33,10 @@ type RouteTable interface {
 	Lookup(uid string) (nodeID string, err error)
 	// Bind 写入映射（登录/重连时由 Logic 调用，§12.4）。
 	Bind(uid, nodeID string) error
-	// Unbind 清除映射（会话释放时）。
-	Unbind(uid string)
-	// Invalidate 缓存失效（§13.4 节点变更通知触发）。
+	// Unbind 条件清除映射：仅当 uid 当前归属 nodeID 时才删除。
+	// 带 nodeID 是为了顶踢/快速重连场景下，旧会话释放不删除新节点刚写入的映射。
+	Unbind(uid, nodeID string)
+	// Invalidate 缓存失效（§13.4 节点变更通知触发）：清除归属该节点的全部映射。
 	Invalidate(nodeID string)
 	// Close 释放资源（如 Watch 协程）。
 	Close()
@@ -111,11 +112,13 @@ func (t *MemRouteTable) Bind(uid, nodeID string) error {
 	return nil
 }
 
-// Unbind 清除映射。
-func (t *MemRouteTable) Unbind(uid string) {
+// Unbind 条件清除映射：仅当 uid 当前归属 nodeID 时才删除（防顶踢/重连误删）。
+func (t *MemRouteTable) Unbind(uid, nodeID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.routes, uid)
+	if t.routes[uid] == nodeID {
+		delete(t.routes, uid)
+	}
 }
 
 // Invalidate 清掉指向某节点的所有路由（节点故障/缩容）。
@@ -146,6 +149,7 @@ type MsgType byte
 const (
 	MsgUnicast       MsgType = 1 // 单推
 	MsgRoomBroadcast MsgType = 2 // 房间广播（逐成员路由模式）
+	MsgKeepalive     MsgType = 3 // 链路保活心跳（接收方直接丢弃，不进业务）
 )
 
 // InnerHeader 内部链路头（§12.3：仅 Gateway↔Logic 之间，客户端不可见）。
@@ -306,6 +310,17 @@ func NewGatewayWithTransport(gatewayID string, registry cluster.NodeRegistry, tr
 	return &Gateway{
 		id:        gatewayID,
 		routes:    NewMemRouteTable(registry),
+		transport: tr,
+		registry:  registry,
+	}
+}
+
+// NewGatewayWithDeps 创建 Gateway 并注入自定义路由表与 Transport。
+// 用于多 Gateway 副本场景：路由表由调用方提供 Redis 共享实现，进程内骨架不传（用默认 Mem）。
+func NewGatewayWithDeps(gatewayID string, registry cluster.NodeRegistry, routes RouteTable, tr NodeTransport) *Gateway {
+	return &Gateway{
+		id:        gatewayID,
+		routes:    routes,
 		transport: tr,
 		registry:  registry,
 	}
