@@ -72,7 +72,7 @@ type ChangeEvent struct {
 //
 // 实现方：
 //   - MemRegistry：进程内实现，单进程集成测试用；
-//   - RedisRegistry：Redis Hash + Pub/Sub 实现，真实拆分部署用。
+//   - RedisRegistry：Redis 独立 key + Pub/Sub 实现，真实拆分部署用。
 type NodeRegistry interface {
 	Register(info NodeInfo) error
 	Heartbeat(id string, activeRooms int) error
@@ -272,11 +272,12 @@ func (r *MemRegistry) publish(ev ChangeEvent) {
 
 // ---------------- RedisRegistry 真实分布式实现 ----------------
 
-// RedisRegistry 用 Redis Hash + Pub/Sub 实现的注册表（§13.2/§13.4）。
+// RedisRegistry 用 Redis 独立 key + Pub/Sub 实现的注册表（§13.2/§13.4）。
 //
-//	key 格式：cluster:nodes:{role}  Hash{ nodeID: JSONNodeInfo }
-//	TTL：每条 Hash 整体 TTL，靠 Heartbeat 续期（实现简化：单 key per node）
-//	Pub/Sub：cluster:nodes:change 频道，载荷为 JSON ChangeEvent
+//	key 格式：cluster:node:{id}  STRING(NodeInfo 编码)
+//	TTL：每节点独立 key 独立 TTL，靠 Heartbeat 续期（崩溃节点可自动过期；
+//	     不用 Hash 是因为 Hash 不支持单 field TTL）
+//	Pub/Sub：cluster:nodes:change 频道，载荷为 "nodeID oldState newState"
 type RedisRegistry struct {
 	client  *redis.Client
 	cfg     Config

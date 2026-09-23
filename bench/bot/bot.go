@@ -242,6 +242,48 @@ func (b *Bot) SendMove(dir int) error {
 	return b.writeFrame(frame)
 }
 
+// SendCall 发送斗地主叫分（MsgCall=0x1300，可靠通道）。score: 0=不叫，1-3 叫分。
+func (b *Bot) SendCall(score int) error {
+	c, _ := protocol.Get(b.codec)
+	req := struct {
+		Score int `json:"score" protobuf:"varint,1,opt,name=score,proto3"`
+	}{Score: score}
+	raw, err := c.Marshal(&req)
+	if err != nil {
+		return err
+	}
+	frame := &transport.Frame{
+		Ver:   transport.ProtocolVer,
+		MsgID: uint32(0x1300), // doudizhu.MsgCall（bot 不 import games 包，保持解耦）
+		Flag:  b.codec,
+		Seq:   b.nextSeq(),
+		Body:  raw,
+	}
+	b.msgsSent.Add(1)
+	return b.writeFrame(frame)
+}
+
+// SendPlay 发送斗地主出牌（MsgPlay=0x1301，可靠通道）。ids 为牌 ID 列表，空=过牌。
+func (b *Bot) SendPlay(ids []int) error {
+	c, _ := protocol.Get(b.codec)
+	req := struct {
+		IDs []int `json:"ids" protobuf:"varint,1,rep,packed,name=ids,proto3"`
+	}{IDs: ids}
+	raw, err := c.Marshal(&req)
+	if err != nil {
+		return err
+	}
+	frame := &transport.Frame{
+		Ver:   transport.ProtocolVer,
+		MsgID: uint32(0x1301), // doudizhu.MsgPlay
+		Flag:  b.codec,
+		Seq:   b.nextSeq(),
+		Body:  raw,
+	}
+	b.msgsSent.Add(1)
+	return b.writeFrame(frame)
+}
+
 // RecvLoop 持续读取帧并交给 handler。
 func (b *Bot) RecvLoop(ctx context.Context, handler func(f *transport.Frame)) error {
 	for {

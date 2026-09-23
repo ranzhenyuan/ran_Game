@@ -25,6 +25,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/rangame/server/games/card"
+	"github.com/rangame/server/games/doudizhu"
 	"github.com/rangame/server/games/quiz"
 	"github.com/rangame/server/games/snake"
 	"github.com/rangame/server/internal/app"
@@ -56,8 +57,8 @@ func main() {
 	}
 
 	// 玩法模块装配（games 仅依赖 pkg/framework，由 cmd 注入）。
-	// 列表索引决定消息 ID 段（0→0x1000, 1→0x1100, 2→0x1200），上线后不得调整顺序。
-	modules := []framework.GameModule{snake.Module{}, card.Module{}, quiz.Module{}}
+	// 列表索引决定消息 ID 段（0→0x1000, 1→0x1100, 2→0x1200, 3→0x1300），上线后不得调整顺序。
+	modules := []framework.GameModule{snake.Module{}, card.Module{}, quiz.Module{}, doudizhu.Module{}}
 
 	// 按 server.role 分派装配（§12.6）。
 	var srv *app.Server

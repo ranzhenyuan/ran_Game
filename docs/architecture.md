@@ -1,6 +1,8 @@
 # 通用小游戏后端框架 — 架构设计文档
 
-> 版本：v0.5（设计稿）　|　语言：Go 1.22+　|　状态：本期仅设计，不含实现
+> 版本：v1.0（已实现）　|　语言：Go 1.24+　|　状态：单机形态与演进态（Gateway/Logic 拆分）均已落地，详见 docs/PROGRESS.md
+>
+> v1.0：单机全量实现 + 演进态四阶段落地（Redis 共享路由表、Gateway↔Logic TCP 长连接、Logic↔Redis 长连接容错、连接预热+注册表联动+双向对称），均通过端到端测试。
 >
 > v0.5 补充：玩家档案/游戏存档（§10.4：ProfileStore 接口、PlayerProfile 混合字段、周期 checkpoint + 退出强存、离线查询服务、PlayerActor 集成点、故障降级、schema）。
 >

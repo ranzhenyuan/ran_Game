@@ -21,7 +21,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "ws://127.0.0.1:7001", "WS 服务器地址")
-	scenario := flag.String("scenario", "heartbeat", "场景: heartbeat|broadcast|random|reconnect|play|all")
+	scenario := flag.String("scenario", "heartbeat", "场景: heartbeat|broadcast|random|reconnect|play|doudizhu|all")
 	bots := flag.Int("bots", 50, "连接数（play 场景固定 2）")
 	duration := flag.Duration("duration", 10*time.Second, "压测时长（play 场景为对局超时上限）")
 	codec := flag.String("codec", "pb", "序列化: json|pb")
@@ -71,6 +71,22 @@ func main() {
 		out := bot.RunPlayMatch(context.Background(), cfg)
 		fmt.Printf("[play] finished=%v winner=%q rounds=%d duration=%s\n",
 			out.Finihed, out.Winner, out.Rounds, out.Duration)
+		fmt.Println("uids:")
+		for _, uid := range out.UIDs {
+			fmt.Printf("  %s\n", uid)
+		}
+		fmt.Println("verify: docker exec logic curl -s http://127.0.0.1:7100/admin/players/<uid>")
+		return
+	}
+
+	// doudizhu 场景：3 bot 斗地主端到端对局（匹配→叫分→出牌→结算）。
+	if *scenario == "doudizhu" {
+		if *duration < 60*time.Second {
+			*duration = 60 * time.Second
+		}
+		out := bot.RunDoudizhuMatch(context.Background(), cfg)
+		fmt.Printf("[doudizhu] finished=%v landlord=%q landlord_win=%v base=%d duration=%s\n",
+			out.Finished, out.Landlord, out.LandlordWin, out.BaseScore, out.Duration)
 		fmt.Println("uids:")
 		for _, uid := range out.UIDs {
 			fmt.Printf("  %s\n", uid)

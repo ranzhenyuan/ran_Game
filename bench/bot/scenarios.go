@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -192,6 +193,287 @@ func RunPlayMatch(ctx context.Context, cfg ScenarioConfig) PlayOutcome {
 	wg.Wait()
 	out.Duration = time.Since(start)
 	return out
+}
+
+// doudizhu 帧消息 ID（bot 不 import games 包，保持解耦；与 games/doudizhu/messages.go 对齐）。
+const (
+	msgDDZDeal   = 0x1310 // 下行发牌（单推本人手牌）
+	msgDDZStage  = 0x1311 // 下行阶段切换
+	msgDDZCall   = 0x1312 // 下行叫分事件
+	msgDDZPlayed = 0x1313 // 下行出牌/过牌事件
+	msgDDZTurn   = 0x1314 // 下行轮到谁
+	msgDDZResult = 0x1316 // 下行结算
+)
+
+// 斗地主阶段（与 StageWaiting/Bidding/Playing/Finished 对齐）。
+const (
+	ddzStageBidding = 1
+	ddzStagePlaying = 2
+)
+
+// ddzCard 客户端侧牌结构（与 doudizhu.Card 字段对齐）。
+type ddzCard struct {
+	Suit  int `json:"suit" protobuf:"varint,1,opt,name=suit,proto3"`
+	Rank  int `json:"rank" protobuf:"varint,2,opt,name=rank,proto3"`
+	Joker int `json:"joker" protobuf:"varint,3,opt,name=joker,proto3"`
+}
+
+// cardID 与 doudizhu.Card.ID() 保持一致：用于按 ID 出牌。
+func ddzCardID(c ddzCard) int {
+	if c.Joker >= 0 {
+		return 100 + c.Joker
+	}
+	return c.Suit*100 + c.Rank
+}
+
+// DoudizhuOutcome 斗地主对局结果（存档 e2e 验证用）。
+type DoudizhuOutcome struct {
+	UIDs        []string // 参局 bot UID
+	Landlord    string   // 地主 UID
+	LandlordWin bool     // 地主是否胜利
+	BaseScore   int      // 叫分底分
+	Finished    bool     // 是否正常收到结算（false=超时兜底）
+	Duration    time.Duration
+}
+
+// RunDoudizhuMatch 斗地主端到端场景：3 bot 匹配成桌 → 叫分 → 轮转出牌 → 结算。
+// 策略（验证同步链路，非智能 AI）：叫分按当前最高分 +1 直至封顶；出牌只出单张，
+// 压不过则过。收到 MsgResult 后主动断开，触发宽限→退出强存（§10.4.4）。
+func RunDoudizhuMatch(ctx context.Context, cfg ScenarioConfig) DoudizhuOutcome {
+	start := time.Now()
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	cfg.Module = "doudizhu" // 锁定模块
+	if cfg.Bots != 3 {
+		cfg.Bots = 3 // 一桌三人
+	}
+
+	ts := time.Now().UnixNano() % 100000
+	out := DoudizhuOutcome{}
+
+	// 整体超时兜底：避免对局逻辑卡死时 bot 永久阻塞；超时后打印各 bot 诊断信息。
+	// naive bot 只出单张且频繁过牌，完整对局可能接近一分钟，故留足余量。
+	runCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	type diag struct {
+		uid  string
+		n    int
+		last uint32
+		hand int
+	}
+	diags := make([]diag, 3)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i := 0; i < 3; i++ {
+		uid := fmt.Sprintf("ddz-%d-%d", i, ts)
+		out.UIDs = append(out.UIDs, uid)
+		wg.Add(1)
+		go func(idx int, uid string) {
+			defer wg.Done()
+			b := New(Config{ID: idx, UID: uid, Codec: cfg.Codec, Logger: logger})
+			if err := b.ConnectTo(ctx, cfg.Addr); err != nil {
+				logger.Error("connect", "uid", uid, "err", err)
+				return
+			}
+			defer func() { _ = b.Close() }()
+
+			c, _ := protocol.Get(cfg.Codec)
+			frames := make(chan *transport.Frame, 256)
+			recvCtx, cancelRecv := context.WithCancel(runCtx)
+			defer cancelRecv()
+			frameCount := 0
+			var lastMsg uint32
+			var hand []ddzCard // 提前声明：defer 诊断需捕获，且在本 goroutine 内串行访问
+			go func() {
+				_ = b.RecvLoop(recvCtx, func(f *transport.Frame) {
+					frameCount++
+					lastMsg = f.MsgID
+					frames <- f
+				})
+			}()
+			defer func() {
+				mu.Lock()
+				diags[idx] = diag{uid: uid, n: frameCount, last: lastMsg, hand: len(hand)}
+				mu.Unlock()
+			}()
+
+			if err := b.SendMatch(cfg.Module, cfg.Code); err != nil {
+				logger.Error("match", "uid", uid, "err", err)
+				return
+			}
+
+			// 单 bot 状态：只在本 goroutine 访问（hand 已提前声明）。
+			var (
+				stage      int
+				curUID     string
+				maxScore   int
+				lastPlayed *struct {
+					UID   string
+					Cards []ddzCard
+					Pass  bool
+				}
+			)
+
+			// act 在轮到本人时按阶段发请求。
+			act := func() {
+				if curUID != uid {
+					return
+				}
+				if stage == ddzStageBidding {
+					score := 0
+					if maxScore < 3 {
+						score = maxScore + 1 // 叫分必须高于当前最高分
+					}
+					_ = b.SendCall(score)
+					return
+				}
+				if stage == ddzStagePlaying {
+					ids := pickSinglePlay(hand, lastPlayed, uid)
+					_ = b.SendPlay(ids)
+				}
+			}
+
+			for {
+				select {
+				case f := <-frames:
+					switch f.MsgID {
+					case msgDDZDeal:
+						var h struct {
+							Hand      []ddzCard `json:"hand" protobuf:"bytes,1,rep,name=hand,proto3"`
+							Landlord3 []ddzCard `json:"landlord3,omitempty" protobuf:"bytes,2,rep,name=landlord3,proto3"`
+						}
+						if err := c.Unmarshal(f.Body, &h); err == nil {
+							// 发牌（含流局重发）是全新一手：必须替换而非追加，否则持有过期牌 ID 会被服务端拒绝。
+							hand = append([]ddzCard{}, h.Hand...)
+							hand = append(hand, h.Landlord3...)
+						}
+					case msgDDZStage:
+						var s struct {
+							Stage int `json:"stage" protobuf:"varint,1,opt,name=stage,proto3"`
+						}
+						if c.Unmarshal(f.Body, &s) == nil {
+							stage = s.Stage
+						}
+					case msgDDZCall:
+						var cl struct {
+							UID   string `json:"uid" protobuf:"bytes,1,opt,name=uid,proto3"`
+							Score int    `json:"score" protobuf:"varint,2,opt,name=score,proto3"`
+						}
+						if c.Unmarshal(f.Body, &cl) == nil && cl.Score > maxScore {
+							maxScore = cl.Score
+						}
+					case msgDDZPlayed:
+						var p struct {
+							UID   string    `json:"uid" protobuf:"bytes,1,opt,name=uid,proto3"`
+							Cards []ddzCard `json:"cards,omitempty" protobuf:"bytes,2,rep,name=cards,proto3"`
+							Type  string    `json:"type" protobuf:"bytes,3,opt,name=type,proto3"`
+							Pass  bool      `json:"pass" protobuf:"varint,4,opt,name=pass,proto3"`
+						}
+						if c.Unmarshal(f.Body, &p) == nil {
+							if p.Pass {
+								// 过牌不改变「上一手真牌」：服务端 lastPlayed 仍指向最近一次实牌，
+								// 此处若覆盖为空会导致 bot 误判压牌/自由出牌，发出被服务端拒绝的牌。
+							} else {
+								lastPlayed = &struct {
+									UID   string
+									Cards []ddzCard
+									Pass  bool
+								}{UID: p.UID, Cards: p.Cards}
+								if p.UID == uid {
+									hand = removeCards(hand, p.Cards) // 服务端确认后移除本地手牌
+								}
+							}
+						}
+					case msgDDZTurn:
+						var t struct {
+							CurUID string `json:"cur_uid" protobuf:"bytes,1,opt,name=cur_uid,proto3"`
+						}
+						if c.Unmarshal(f.Body, &t) == nil {
+							curUID = t.CurUID
+							act()
+						}
+					case msgDDZResult:
+						var r struct {
+							RoomID      string `json:"room_id" protobuf:"bytes,1,opt,name=room_id,proto3"`
+							Landlord    string `json:"landlord" protobuf:"bytes,2,opt,name=landlord,proto3"`
+							LandlordWin bool   `json:"landlord_win" protobuf:"varint,4,opt,name=landlord_win,proto3"`
+							BaseScore   int    `json:"base_score" protobuf:"varint,5,opt,name=base_score,proto3"`
+							Timeout     bool   `json:"timeout" protobuf:"varint,6,opt,name=timeout,proto3"`
+						}
+						if c.Unmarshal(f.Body, &r) == nil {
+							mu.Lock()
+							out.Landlord, out.LandlordWin, out.BaseScore, out.Finished =
+								r.Landlord, r.LandlordWin, r.BaseScore, true
+							mu.Unlock()
+							logger.Info("ddz settled", "uid", uid, "landlord", r.Landlord,
+								"win", r.LandlordWin, "base", r.BaseScore, "timeout", r.Timeout)
+						}
+						return
+					}
+				case <-runCtx.Done():
+					logger.Warn("ddz bot timeout", "uid", uid, "frames", frameCount, "last", lastMsg, "hand", len(hand))
+					return
+				}
+			}
+		}(i, uid)
+	}
+	wg.Wait()
+	out.Duration = time.Since(start)
+	// 诊断：打印各 bot 收到的帧数、最后一帧 msgID、剩余手牌数，定位卡在哪一步。
+	for _, d := range diags {
+		fmt.Printf("[diag] uid=%s frames=%d last=0x%x hand=%d\n", d.uid, d.n, d.last, d.hand)
+	}
+	return out
+}
+
+// pickSinglePlay 单张出牌策略：自由出牌（上家为自己/无 last）出最小单张；
+// 否则出能压过上家单张的最小单张，压不过返回 nil（过牌）。
+func pickSinglePlay(hand []ddzCard, last *struct {
+	UID   string
+	Cards []ddzCard
+	Pass  bool
+}, uid string) []int {
+	if len(hand) == 0 {
+		return nil
+	}
+	cp := append([]ddzCard(nil), hand...)
+	sort.Slice(cp, func(i, j int) bool { return cp[i].Rank < cp[j].Rank })
+
+	freeLead := last == nil || last.Pass || last.UID == uid
+	if freeLead {
+		return []int{ddzCardID(cp[0])}
+	}
+	// 求上家主 Rank（单张策略下取最大）。
+	lastMain := 0
+	for _, c := range last.Cards {
+		if c.Rank > lastMain {
+			lastMain = c.Rank
+		}
+	}
+	for _, c := range cp {
+		if c.Rank > lastMain {
+			return []int{ddzCardID(c)}
+		}
+	}
+	return nil // 压不过，过牌
+}
+
+// removeCards 从手牌移除已打出的牌（按 ID 匹配）。
+func removeCards(hand []ddzCard, played []ddzCard) []ddzCard {
+	rm := make(map[int]bool, len(played))
+	for _, c := range played {
+		rm[ddzCardID(c)] = true
+	}
+	kept := hand[:0]
+	for _, c := range hand {
+		if !rm[ddzCardID(c)] {
+			kept = append(kept, c)
+		}
+	}
+	return kept
 }
 
 func runScenario(ctx context.Context, cfg ScenarioConfig, mode string) Result {

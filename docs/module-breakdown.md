@@ -1,6 +1,6 @@
 # 模块拆分与接口蓝图
 
-> 配套文档：[architecture.md](./architecture.md)（v0.4）　|　版本：v0.1　|　Go 1.22+
+> 配套文档：[architecture.md](./architecture.md)（v1.0 已实现）　|　版本：v1.0　|　Go 1.24+
 >
 > 本文把架构设计落地为三份实现蓝图：**① 模块职责清单 → ② 接口清单（Go）→ ③ Proto 文件**。
 > 假设 go.mod module 路径为 `github.com/rangame/server`（实现时按实际仓库替换，全文 import 前缀同步改）。
